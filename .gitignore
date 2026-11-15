@@ -1,0 +1,20 @@
+# Build output
+build/
+build-*/
+out/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Editors and tools
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+
+# OS
+.DS_Store
+Thumbs.db

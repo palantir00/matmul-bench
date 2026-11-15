@@ -1,0 +1,5 @@
+# The repo is edited on Windows but built and run in WSL:
+# keep LF line endings in the working tree so shell scripts do not break.
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
