@@ -44,18 +44,26 @@ if(MATMUL_BUILD_BENCH)
   FetchContent_MakeAvailable(benchmark)
 endif()
 
+# ---- Library ----------------------------------------------------------------
+add_library(matmul
+  src/naive.cpp)
+target_include_directories(matmul PUBLIC include)
+target_link_libraries(matmul PUBLIC matmul_flags)
+
 # ---- Tests ------------------------------------------------------------------
 enable_testing()
 include(GoogleTest)
 
 add_executable(matmul_tests
-  tests/test_hello.cpp)
-target_link_libraries(matmul_tests PRIVATE matmul_flags GTest::gtest_main)
+  tests/test_hello.cpp
+  tests/test_matmul.cpp)
+target_link_libraries(matmul_tests PRIVATE matmul GTest::gtest_main)
 gtest_discover_tests(matmul_tests)
 
 # ---- Benchmarks -------------------------------------------------------------
 if(MATMUL_BUILD_BENCH)
   add_executable(matmul_bench
-    bench/bench_bandwidth.cpp)
-  target_link_libraries(matmul_bench PRIVATE matmul_flags benchmark::benchmark_main)
+    bench/bench_bandwidth.cpp
+    bench/bench_matmul.cpp)
+  target_link_libraries(matmul_bench PRIVATE matmul benchmark::benchmark_main)
 endif()

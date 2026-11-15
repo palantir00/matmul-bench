@@ -1,12 +1,14 @@
-// Stage 0 smoke benchmark: checks that Google Benchmark works and shows how
-// throughput drops as the working set moves from L1 to L2, L3 and DRAM.
-// Later (stage 5) these numbers serve as measured bandwidths for the roofline model.
+// Memory-hierarchy benchmark: shows how throughput drops as the working set moves
+// from L1 to L2, L3 and DRAM. In stage 5 these numbers serve as measured bandwidths
+// for the roofline model.
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
+
+#include "matmul/matrix.hpp"
 
 namespace {
 
@@ -20,17 +22,18 @@ void saxpy(float a, const float* x, float* y, std::size_t n) {
 
 void BM_Saxpy(benchmark::State& state) {
     const auto n = static_cast<std::size_t>(state.range(0));
-    // NOTE: std::vector only guarantees 16-byte alignment. When y is not 32-byte aligned,
-    // every second AVX store splits across two cache lines, so the L1-sized case varies
-    // ~1.5x between repetitions (see docs/NOTES.md, stage 0). Stage 1 adds 64-byte aligned buffers.
-    std::vector<float> x(n, 1.0f);
-    std::vector<float> y(n, 0.0f);
+    // Cache-line aligned buffers. With 16-byte aligned std::vector storage the L1 case
+    // varied ~1.5x between repetitions because of split stores (docs/NOTES.md, stage 0).
+    auto x = matmul::alloc_aligned(n);
+    auto y = matmul::alloc_aligned(n);
+    std::fill(x.get(), x.get() + n, 1.0f);
+    std::fill(y.get(), y.get() + n, 0.0f);
     const float a = 0.5f;
 
     for (auto _ : state) {
-        saxpy(a, x.data(), y.data(), n);
+        saxpy(a, x.get(), y.get(), n);
         // Make the compiler believe y is used, so the loop cannot be removed.
-        benchmark::DoNotOptimize(y.data());
+        benchmark::DoNotOptimize(y.get());
         benchmark::ClobberMemory();
     }
 

@@ -63,6 +63,10 @@ Przy obciążeniu wszystkich rdzeni laptop ogranicza limit mocy (45 W bazowo, ch
 i chłodzenie. Realny szczyt wielowątkowy leży więc gdzieś w przedziale 576–1171 i trzeba go
 zmierzyć, a nie założyć. **Punkt odniesienia dla wersji jednowątkowych (etapy 1–3): ~157 GFLOP/s.**
 
+> **Aktualizacja z etapu 1:** zmierzony zegar rdzenia P przy obecnych ustawieniach zasilania to
+> ok. 2,84 GHz, a nie 4,9 GHz. Realny szczyt jednego rdzenia wynosi więc 32 × 2,84 ≈ **91 GFLOP/s**.
+> Szczegóły w sekcji etapu 1.
+
 ### GFLOP/s dla mnożenia macierzy
 
 Dla C = A·B (N×N) każdy z N² elementów C jest iloczynem skalarnym długości N, czyli N mnożeń
@@ -170,3 +174,154 @@ Obserwacje:
 - Turbo Boost: z WSL go nie wyłączymy, więc raportujemy uczciwie, że był włączony.
 - Projekt leży na dysku Windows (`/mnt/c`), co spowalnia build (pierwsza konfiguracja ok. 2 min).
   Na wynik pomiaru nie ma to wpływu, bo dane programu są w RAM.
+
+---
+
+## Etap 1: wersja naiwna (i-j-k)
+
+### Kod
+
+```cpp
+for i: for j: { sum = 0; for k: sum += A[i*n + k] * B[k*n + j]; C[i*n + j] = sum; }
+```
+
+`A[i][k]` idzie po wierszu, kolejne adresy co 4 B. `B[k][j]` idzie w dół kolumny, co `n·4` B.
+
+### Dlaczego dostęp do B po kolumnach kosztuje
+
+1. **Każdy element B to osobna linia cache.** Z 64 B linii używamy 4 B (6%). Pozostałe 15
+   floatów z tej linii przydadzą się dopiero przy kolejnych `j`, o ile linia do tego czasu
+   przetrwa w cache.
+2. **Brak prawdziwej wektoryzacji.** Rejestr AVX ładuje 8 sąsiednich floatów, a elementy
+   kolumny B leżą co `n` floatów. GCC zrobił półśrodek. Wczytuje 4 elementy kolumny pojedynczo
+   i składa je w rejestr (ręczny *gather*), mnoży 4 naraz (`vmulps`), a potem dodaje 4 iloczyny
+   do `sum` po kolei, czterema skalarnymi `vaddss`. Kolejność dodawania jest zachowana, więc
+   wynik jest taki jak w kodzie źródłowym i nie trzeba `-ffast-math`. Ciekawostka: główna pętla
+   używa osobnego mnożenia i dodawania (dwa zaokrąglenia), a pętla dla reszty `n mod 4` używa
+   FMA (jedno zaokrąglenie).
+3. **Konflikty w zbiorach cache przy potęgach dwójki.** Linia trafia do zbioru wyznaczonego
+   przez bity 6–11 adresu w L1 (64 zbiory, 12 dróg) i bity 6–16 w L2 (2048 zbiorów, 10 dróg).
+   Skok o 4 KiB nie zmienia bitów 6–11, więc cała kolumna B wpada do jednego zbioru L1.
+
+   | N | skok | miejsca w L1 | miejsca w L2 | linii w kolumnie |
+   |---|---|---|---|---|
+   | 256 | 1 KiB | 4 zbiory × 12 = 48 | 128 × 10 = 1280 | 256 |
+   | 512 | 2 KiB | 2 × 12 = 24 | 64 × 10 = 640 | 512 |
+   | 1024 | 4 KiB | 1 × 12 = 12 | 32 × 10 = **320** | **1024** |
+   | 1000 | ~3,9 KiB | rozłożone | rozłożone | 1000 |
+
+4. **Prefetcher nie przekracza granicy strony 4 KiB.** Przy N = 1024 każdy krok to nowa strona,
+   więc sprzętowy prefetcher nie pomaga, a każdy dostęp to też chybienie w L1 DTLB.
+
+### Drugi hamulec: łańcuch zależności
+
+`sum += …` to łańcuch: każde dodawanie czeka na wynik poprzedniego. Bez `-ffast-math`
+kompilator nie może rozbić sumy na kilka niezależnych, bo zmieniłby wynik (o tym niżej).
+Tempo jest więc ograniczone **opóźnieniem** dodawania, a nie przepustowością jednostek.
+
+Opóźnienia zmierzone metodą proporcji: łańcuch `add rejestr, rejestr` (1 cykl) wyznacza
+długość cyklu, a łańcuch badanej instrukcji podzielony przez niego daje opóźnienie w cyklach.
+Kontrola: `imul` wyszło 3,04 przy oczekiwanych 3.
+
+| | Wynik |
+|---|---|
+| zegar rdzenia (obecne ustawienia zasilania) | **~2,84 GHz** |
+| `vaddss` (dodawanie FP) | **2 cykle** |
+| `vfmadd231ss` (FMA) | **4 cykle** |
+
+Pułapka: łańcuch `add rejestr, stała` dał „zegar 15 GHz”. Rdzenie Golden/Raptor Cove wykonują
+dodawanie stałej już na etapie przemianowywania rejestrów (*renaming*), więc taki łańcuch nie
+trwa 1 cykl na instrukcję. Wzorzec do pomiaru musi być instrukcją, której procesor nie umie
+skrócić.
+
+**Granica dla wersji naiwnej:** 1 iteracja pętli k (2 FLOP) na 2 cykle, czyli
+1 FLOP/cykl × 2,84 GHz = **2,84 GFLOP/s**. Zmierzone 2,27 to 80% tej granicy. Resztę zjada
+prawdopodobnie ręczny gather: 6 instrukcji tasowania na 4 elementy obciąża ten sam port.
+
+**Realny szczyt przy tym zegarze:** 32 FLOP/cykl × 2,84 GHz ≈ **91 GFLOP/s** zamiast 157.
+Zegar 2,84 GHz zamiast 4,9 GHz turbo to wynik obecnych ustawień zasilania („Zrównoważony”
+i ewentualnie profil producenta laptopa).
+
+### Wyniki (pomiar roboczy, 5 powtórzeń, mediana, 1 wątek)
+
+| N | czas | GFLOP/s | CV | % szczytu (91) | cykli na iterację k |
+|---|---|---|---|---|---|
+| 256 | 14,8 ms | 2,28 | 5,8% | 2,5% | 2,5 |
+| 512 | 181 ms | 1,47 | 8,8% | 1,6% | 3,9 |
+| 1000 | 880 ms | 2,27 | 2,9% | 2,5% | 2,5 |
+| 1024 | 6213 ms | **0,35** | 5,8% | 0,4% | **16,4** |
+
+Hipoteza przed pomiarem: ok. 2 GFLOP/s dla 256, 512 i 1000 (ogranicza łańcuch) oraz
+1–1,5 GFLOP/s dla 1024 (konflikty w L2).
+
+Interpretacja:
+- **256 i 1000 mają identyczne tempo**, choć kolumna B przy N = 1000 jest 4× dłuższa. To znak, że
+  ogranicza łańcuch dodawań, a nie pamięć. Odczyty B nie zależą od `sum`, więc procesor
+  wykonujący instrukcje poza kolejnością (out-of-order) wczytuje je z L2 wiele iteracji naprzód
+  i chowa opóźnienie.
+- **1024 jest 6,5× wolniejsze niż 1000** przy prawie tej samej pracy i ilości danych. Różni je
+  tylko wzorzec adresów. Kolumna potrzebuje 1024 miejsc w L2, a ma 320, więc praktycznie każdy
+  odczyt B idzie do L3. 16 cykli na iterację przy opóźnieniu L3 rzędu kilkudziesięciu cykli
+  oznacza, że równolegle obsługiwanych jest tylko kilka chybień naraz. Spadek był dużo większy,
+  niż przewidywała hipoteza. Dokładny rozkład przyczyn (L3, TLB, liczba chybień w locie)
+  wymagałby liczników sprzętowych, a WSL2 ich domyślnie nie udostępnia.
+- **512 jest pośrodku (1,47).** Kolumna zajmuje 512 z 640 miejsc w swoich zbiorach L2, czyli 8 z 10
+  dróg, a o te same zbiory konkurują inne dane. Część odczytów wypada więc do L3. To
+  prawdopodobne wyjaśnienie, ale bez liczników niepotwierdzone.
+- CV dla 256, 512 i 1024 przekracza 5%. Różnice 1,5× i 6,5× są dużo większe od szumu, więc
+  wnioski się trzymają, ale liczby do README trzeba zmierzyć ponownie w spokojnych warunkach.
+- Hipoteza dała dobrą liczbę dla 256 (2,3) z dwóch złych powodów, które się znosiły: opóźnienie
+  4 cykle przy 4,5 GHz zamiast 2 cykli przy 2,84 GHz. Zgodność liczby nie dowodzi mechanizmu.
+
+### Poprawność: dlaczego tolerancja i dlaczego względem Σ|a·b|
+
+**Dodawanie floatów nie jest łączne.** Każdy wynik jest zaokrąglany do najbliższej liczby
+reprezentowalnej (24 bity mantysy). Przykład: w okolicy 10⁸ odstęp między kolejnymi floatami
+to 8, więc:
+
+```
+(1e8 + 1) - 1e8 = 0        // 1e8 + 1 rounds back to 1e8
+(1e8 - 1e8) + 1 = 1
+```
+
+Inna kolejność sumowania (inny porządek pętli, bloki w tilingu, podział na wątki, inne użycie FMA)
+oznacza inne zaokrąglenia, a więc wynik różny na ostatnich bitach. Test nie może wymagać
+równości bit w bit.
+
+**Oszacowanie błędu iloczynu skalarnego długości n:**
+
+```
+|fl(Σ a_k·b_k) − Σ a_k·b_k|  ≤  ~n·u · Σ|a_k·b_k|        u = 2⁻²⁴ ≈ 6·10⁻⁸
+```
+
+Test sprawdza każdy element: `|C_ij − ref_ij| ≤ n·eps · Σ_k |a_ik·b_kj|`, gdzie eps = 2u
+(2× zapasu), a referencja jest liczona w `double`.
+
+Dlaczego względem Σ|a·b|, a nie względem wyniku: gdy składniki się znoszą, wynik może być
+bliski 0, a błąd zaokrągleń nie znika. Test typu `|C − ref| / |ref|` dawałby wtedy fałszywe
+błędy dla losowych danych.
+
+Zmierzony błąd jest dużo mniejszy niż oszacowanie najgorszego przypadku, bo błędy zaokrągleń
+mają losowe znaki i częściowo się znoszą:
+
+| n | max \|błąd\| / Σ\|a·b\| | granica n·eps |
+|---|---|---|
+| 1 | 2,0·10⁻⁸ | 1,2·10⁻⁷ |
+| 64 | 1,6·10⁻⁷ | 7,6·10⁻⁶ |
+| 256 | 2,1·10⁻⁷ | 3,1·10⁻⁵ |
+
+**Testy i co każdy łapie:**
+- `HandComputed2x2`: ręcznie policzony wynik. Przy okazji łapie pomylenie A·B z B·A.
+- `IdentityIsExact`: A·I = A bit w bit, bo mnożenie przez 1 i dodawanie 0 nie zaokrągla.
+- `OverwritesC`: C wypełnione NaN przed wywołaniem. Łapie kernel, który dodaje do starej
+  zawartości C zamiast ją nadpisać. Ważne od etapu 2, gdzie i-k-j akumuluje w C.
+- `NaiveVsExact`: rozmiary 1, 2, 7, 16, 64, 127, 129, 256. Nieparzyste rozmiary przydadzą się
+  przy tilingu, gdzie ostatni blok jest mniejszy od pozostałych.
+- `Tolerance.CatchesMissingTerm`: test testu. Usuwamy jeden składnik sumy i sprawdzamy, że
+  porównanie to wykrywa. Tolerancja (~5·10⁻⁴) jest ok. 2000× mniejsza od pojedynczego składnika.
+- A i B mają różne ziarna (42 i 43). Przy A = B kernel liczący B·A zamiast A·B przeszedłby testy.
+
+### saxpy po wyrównaniu buforów do 64 B
+
+L1: mediana 33,8 GFLOP/s, CV 4,6%, zakres 30,8–35,4. Wolnej grupy 22–25 GFLOP/s już nie ma.
+To potwierdza diagnozę z etapu 0: przyczyną były zapisy przecinające granicę linii cache.
