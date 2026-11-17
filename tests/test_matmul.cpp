@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <limits>
+#include <ostream>
 #include <sstream>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "matmul/matmul.hpp"
@@ -13,13 +17,29 @@
 namespace {
 
 using matmul::Matrix;
+using Kernel = void (*)(const float*, const float*, float*, int);
+
+struct KernelCase {
+    const char* name;
+    Kernel fn;
+};
+
+// Lets GoogleTest print the parameter by name in failure messages.
+void PrintTo(const KernelCase& k, std::ostream* os) { *os << k.name; }
+
+// Every kernel version, naive first. A new version needs one line here and is then
+// covered by all parametrized tests below.
+const KernelCase kAllKernels[] = {
+    {"naive", matmul::naive},
+    {"ikj", matmul::ikj},
+};
 
 // Different seeds for A and B: with A == B, a kernel that computes B * A instead of A * B
 // (or mixes up i and j) would still pass.
 constexpr unsigned kSeedA = 42;
 constexpr unsigned kSeedB = 43;
 
-// Expected value of every element of A * B, computed in double, plus its error scale
+// Reference value of every element of A * B plus its error scale
 // scale_ij = sum_k |a_ik * b_kj|. The rounding error of a float dot product is bounded
 // relative to this sum, not to the result: when terms cancel, the result can be ~0
 // while the accumulated rounding error is not.
@@ -28,6 +48,7 @@ struct Expected {
     std::vector<double> scale;
 };
 
+// Reference computed in double precision.
 Expected exact_product(const Matrix& A, const Matrix& B) {
     const int n = A.n();
     Expected e{std::vector<double>(A.size()), std::vector<double>(A.size())};
@@ -48,13 +69,18 @@ Expected exact_product(const Matrix& A, const Matrix& B) {
     return e;
 }
 
+// Reference taken from another float result R (the naive kernel), with the exact scale.
+Expected as_reference(const Matrix& R, const Expected& exact) {
+    return Expected{std::vector<double>(R.data(), R.data() + R.size()), exact.scale};
+}
+
 // Worst-case rounding error of a length-n float dot product is about n * u * scale,
 // with unit roundoff u = 2^-24. We allow n * eps = 2 * n * u (eps = 2^-23).
 double tolerance(int n) {
     return n * static_cast<double>(std::numeric_limits<float>::epsilon());
 }
 
-// Largest |C_ij - expected_ij| / scale_ij over the matrix (how close we get to the bound).
+// Largest |C_ij - reference_ij| / scale_ij over the matrix (how close we get to the bound).
 double max_error_ratio(const Matrix& C, const Expected& e) {
     double worst = 0.0;
     for (std::size_t idx = 0; idx < C.size(); ++idx) {
@@ -66,7 +92,7 @@ double max_error_ratio(const Matrix& C, const Expected& e) {
     return worst;
 }
 
-// Checks |C_ij - expected_ij| <= rtol * scale_ij for every element.
+// Checks |C_ij - reference_ij| <= rtol * scale_ij for every element.
 ::testing::AssertionResult close_to(const Matrix& C, const Expected& e, double rtol) {
     const int n = C.n();
     int failures = 0;
@@ -92,7 +118,24 @@ double max_error_ratio(const Matrix& C, const Expected& e) {
            << failures << " of " << C.size() << " elements out of tolerance:" << first.str();
 }
 
-TEST(Naive, HandComputed2x2) {
+std::string kernel_name(const ::testing::TestParamInfo<KernelCase>& info) {
+    return info.param.name;
+}
+
+std::string kernel_size_name(const ::testing::TestParamInfo<std::tuple<KernelCase, int>>& info) {
+    return std::string(std::get<0>(info.param).name) + "_n" +
+           std::to_string(std::get<1>(info.param));
+}
+
+// Sizes: tiny, odd and powers of two. Odd sizes matter for blocked versions, where the
+// last block is smaller than the others.
+const int kSizes[] = {1, 2, 7, 16, 64, 127, 129, 256};
+
+// ---- Basic properties, run for every kernel -----------------------------------
+
+class KernelBasics : public ::testing::TestWithParam<KernelCase> {};
+
+TEST_P(KernelBasics, HandComputed2x2) {
     // [1 2]   [5 6]   [19 22]
     // [3 4] x [7 8] = [43 50]      (small integers are exact in float)
     Matrix A(2), B(2), C(2);
@@ -101,7 +144,7 @@ TEST(Naive, HandComputed2x2) {
     std::copy(a, a + 4, A.data());
     std::copy(b, b + 4, B.data());
 
-    matmul::naive(A.data(), B.data(), C.data(), 2);
+    GetParam().fn(A.data(), B.data(), C.data(), 2);
 
     EXPECT_EQ(C(0, 0), 19.0f);
     EXPECT_EQ(C(0, 1), 22.0f);
@@ -109,7 +152,7 @@ TEST(Naive, HandComputed2x2) {
     EXPECT_EQ(C(1, 1), 50.0f);  // B * A would give [23 34; 31 46]
 }
 
-TEST(Naive, IdentityIsExact) {
+TEST_P(KernelBasics, IdentityIsExact) {
     // Multiplying by 1 and adding 0 never rounds, so A * I and I * A equal A bit for bit.
     const int n = 33;
     Matrix A(n), I(n), C(n);
@@ -119,50 +162,92 @@ TEST(Naive, IdentityIsExact) {
         I(i, i) = 1.0f;
     }
 
-    matmul::naive(A.data(), I.data(), C.data(), n);
+    GetParam().fn(A.data(), I.data(), C.data(), n);
     for (std::size_t idx = 0; idx < A.size(); ++idx) {
         ASSERT_EQ(C.data()[idx], A.data()[idx]) << "A * I differs at index " << idx;
     }
-    matmul::naive(I.data(), A.data(), C.data(), n);
+    GetParam().fn(I.data(), A.data(), C.data(), n);
     for (std::size_t idx = 0; idx < A.size(); ++idx) {
         ASSERT_EQ(C.data()[idx], A.data()[idx]) << "I * A differs at index " << idx;
     }
 }
 
-TEST(Naive, OverwritesC) {
-    // Old contents of C must be ignored. NaN poisons any kernel that accumulates into C.
+TEST_P(KernelBasics, OverwritesC) {
+    // Old contents of C must be ignored. NaN poisons any kernel that accumulates into C
+    // without zeroing it first (i-k-j and later versions accumulate into C).
     const int n = 17;
     Matrix A(n), B(n), C(n);
     A.fill_random(kSeedA);
     B.fill_random(kSeedB);
     C.fill(std::numeric_limits<float>::quiet_NaN());
 
-    matmul::naive(A.data(), B.data(), C.data(), n);
+    GetParam().fn(A.data(), B.data(), C.data(), n);
 
     EXPECT_TRUE(close_to(C, exact_product(A, B), tolerance(n)));
 }
 
-// Sizes: tiny, odd and powers of two. Odd sizes matter later for blocked versions,
-// where the last block is smaller than the others.
-class NaiveVsExact : public ::testing::TestWithParam<int> {};
+INSTANTIATE_TEST_SUITE_P(All, KernelBasics, ::testing::ValuesIn(kAllKernels), kernel_name);
 
-TEST_P(NaiveVsExact, WithinRoundingBound) {
-    const int n = GetParam();
+// ---- Accuracy against the double-precision reference --------------------------
+
+class KernelVsExact : public ::testing::TestWithParam<std::tuple<KernelCase, int>> {};
+
+TEST_P(KernelVsExact, WithinRoundingBound) {
+    const auto [kernel, n] = GetParam();
     Matrix A(n), B(n), C(n);
     A.fill_random(kSeedA);
     B.fill_random(kSeedB);
 
-    matmul::naive(A.data(), B.data(), C.data(), n);
+    kernel.fn(A.data(), B.data(), C.data(), n);
 
     const Expected e = exact_product(A, B);
     EXPECT_TRUE(close_to(C, e, tolerance(n)));
-    std::printf("[ info     ] n=%4d  max |error|/scale = %.2e   (bound n*eps = %.2e)\n", n,
-                max_error_ratio(C, e), tolerance(n));
+    std::printf("[ info     ] %-6s n=%4d  max |error|/scale = %.2e   (bound n*eps = %.2e)\n",
+                kernel.name, n, max_error_ratio(C, e), tolerance(n));
 }
 
-INSTANTIATE_TEST_SUITE_P(Sizes, NaiveVsExact, ::testing::Values(1, 2, 7, 16, 64, 127, 129, 256));
+INSTANTIATE_TEST_SUITE_P(Sizes, KernelVsExact,
+                         ::testing::Combine(::testing::ValuesIn(kAllKernels),
+                                            ::testing::ValuesIn(kSizes)),
+                         kernel_size_name);
 
-// The check must be strict enough to catch a real bug, e.g. one forgotten term of a sum
+// ---- Every optimized version against naive ------------------------------------
+// Naive is the reference that is obviously correct by reading it (and is itself checked
+// against double above). Each optimization must agree with it up to rounding.
+
+class KernelVsNaive : public ::testing::TestWithParam<std::tuple<KernelCase, int>> {};
+
+TEST_P(KernelVsNaive, WithinTwiceTheBound) {
+    const auto [kernel, n] = GetParam();
+    Matrix A(n), B(n), C(n), R(n);
+    A.fill_random(kSeedA);
+    B.fill_random(kSeedB);
+
+    kernel.fn(A.data(), B.data(), C.data(), n);
+    matmul::naive(A.data(), B.data(), R.data(), n);
+
+    // Both results lie within n*eps*scale of the exact value, so they lie within
+    // 2*n*eps*scale of each other (triangle inequality).
+    const Expected ref = as_reference(R, exact_product(A, B));
+    EXPECT_TRUE(close_to(C, ref, 2 * tolerance(n)));
+
+    std::size_t identical = 0;
+    for (std::size_t idx = 0; idx < C.size(); ++idx) {
+        identical += (C.data()[idx] == R.data()[idx]) ? 1 : 0;
+    }
+    std::printf("[ info     ] %-6s n=%4d  bit-identical to naive: %5.1f%%   max |diff|/scale = %.2e\n",
+                kernel.name, n, 100.0 * identical / C.size(), max_error_ratio(C, ref));
+}
+
+INSTANTIATE_TEST_SUITE_P(Sizes, KernelVsNaive,
+                         ::testing::Combine(  // skip index 0: naive against itself
+                             ::testing::ValuesIn(std::next(std::begin(kAllKernels)),
+                                                 std::end(kAllKernels)),
+                             ::testing::ValuesIn(kSizes)),
+                         kernel_size_name);
+
+// ---- The check itself ---------------------------------------------------------
+// It must be strict enough to catch a real bug, e.g. one forgotten term of a sum
 // (a typical off-by-one at a block edge).
 TEST(Tolerance, CatchesMissingTerm) {
     const int n = 129;

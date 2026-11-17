@@ -46,7 +46,8 @@ endif()
 
 # ---- Library ----------------------------------------------------------------
 add_library(matmul
-  src/naive.cpp)
+  src/naive.cpp
+  src/ikj.cpp)
 target_include_directories(matmul PUBLIC include)
 target_link_libraries(matmul PUBLIC matmul_flags)
 
@@ -66,4 +67,11 @@ if(MATMUL_BUILD_BENCH)
     bench/bench_bandwidth.cpp
     bench/bench_matmul.cpp)
   target_link_libraries(matmul_bench PRIVATE matmul benchmark::benchmark_main)
+endif()
+
+# ---- Tools ------------------------------------------------------------------
+# Clock / FP latency probe (x86-64 inline assembly). Run before benchmark sessions.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  add_executable(clock_probe tools/clock_probe.cpp)
+  target_link_libraries(clock_probe PRIVATE matmul_flags)
 endif()

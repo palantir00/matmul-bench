@@ -11,4 +11,8 @@ namespace matmul {
 // Version 1: textbook i-j-k loop order. B is walked down a column (stride n floats).
 void naive(const float* A, const float* B, float* C, int n);
 
+// Version 2: i-k-j loop order. The inner loop adds a * (row k of B) to row i of C,
+// so every access is contiguous and the loop vectorizes without reordering the sum.
+void ikj(const float* A, const float* B, float* C, int n);
+
 }  // namespace matmul

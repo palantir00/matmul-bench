@@ -172,6 +172,8 @@ Obserwacje:
   programy (przeglądarka, komunikatory), laptop na twardej powierzchni (chłodzenie). Puszczamy
   dwa przebiegi i porównujemy je ze sobą, bo przegrzanie obniża zegar.
 - Turbo Boost: z WSL go nie wyłączymy, więc raportujemy uczciwie, że był włączony.
+- Przed i po każdej serii pomiarów uruchamiamy `./build/clock_probe` (od etapu 2), żeby wiedzieć,
+  przy jakim zegarze powstały wyniki, i wychwycić przegrzanie.
 - Projekt leży na dysku Windows (`/mnt/c`), co spowalnia build (pierwsza konfiguracja ok. 2 min).
   Na wynik pomiaru nie ma to wpływu, bo dane programu są w RAM.
 
@@ -325,3 +327,225 @@ mają losowe znaki i częściowo się znoszą:
 
 L1: mediana 33,8 GFLOP/s, CV 4,6%, zakres 30,8–35,4. Wolnej grupy 22–25 GFLOP/s już nie ma.
 To potwierdza diagnozę z etapu 0: przyczyną były zapisy przecinające granicę linii cache.
+
+---
+
+## Etap 2: zamiana kolejności pętli (i-k-j)
+
+### Kod
+
+```cpp
+for i: { C[i][:] = 0; for k: { a = A[i][k]; for j: C[i][j] += a * B[k][j]; } }
+```
+
+Te same mnożenia i dodawania, w tej samej liczbie. Zmienia się tylko kolejność, w jakiej
+odwiedzamy elementy. Pętla wewnętrzna to teraz dokładnie saxpy z etapu 0:
+**wiersz C += a × wiersz B**.
+
+### Co czyta jedna iteracja pętli wewnętrznej
+
+```
+i-j-k (naive): jeden element C = wiersz A · kolumna B
+
+          A                    B                    C
+     k ───────►           j                    j
+  i [■■■■■■■■■■]     k  [ ■        ]     i  [ ■        ]
+                     │  [ ■        ]
+                     │  [ ■        ]       każdy ■ w B to inna linia cache,
+                     ▼  [ ■        ]       skok o n·4 B (przy N=1024 to 4 KiB,
+                        [ ■        ]       czyli nowa strona pamięci)
+
+i-k-j: cały wiersz C += jedna liczba z A × cały wiersz B
+
+          A                    B                    C
+     k                         j ───────►           j ───────►
+  i [ ■        ]     k  [■■■■■■■■■■]     i  [■■■■■■■■■■]
+    jedna liczba,        ciągły wiersz,       ciągły wiersz,
+    ta sama dla          czytany od           ten sam dla wszystkich k,
+    całego wiersza       początku do końca    siedzi w L1 (≤ 4 KiB)
+```
+
+Dla ustalonego `i` pętla po `k` przechodzi przez B wiersz po wierszu, czyli przez **całą
+macierz B po kolei**, tak jak leży w pamięci:
+
+```
+pamięć B:  [wiersz 0][wiersz 1][wiersz 2] ... [wiersz n-1]   ──► jeden ciągły strumień, raz na każde i
+```
+
+### Dlaczego to pomaga
+
+1. **Linie cache wykorzystane w całości.** Z każdej wczytanej 64-bajtowej linii B używamy
+   wszystkich 16 floatów, zamiast jednego.
+2. **Prefetcher ma łatwe zadanie.** Widzi jeden rosnący strumień adresów i ściąga dane
+   z wyprzedzeniem. Prefetcher nie przekracza granicy strony 4 KiB, więc mniej więcej co 4 KiB
+   (przy N=1024 co jeden wiersz B) musi zacząć strumień od nowa. To niewielki koszt.
+3. **Nie ma już łańcucha zależności.** W pętli j każde `C[i][j]` jest niezależne od sąsiednich,
+   więc procesor może liczyć wiele naraz. Element `C[i][j]` dalej dostaje składniki w kolejności
+   k = 0, 1, …, n−1, tak jak w wersji naiwnej, więc kompilator wektoryzuje bez `-ffast-math`.
+   Nie przestawia sumy, tylko liczy 8 różnych sum jednocześnie.
+4. **Nie ma konfliktów zbiorów przy potęgach dwójki.** Konflikty z etapu 1 wynikały ze skoku
+   o n·4 B w dół kolumny. Tutaj adresy idą po kolei, więc N=1024 nie powinno się już niczym
+   wyróżniać.
+
+### Co zrobił kompilator
+
+Raport wektoryzacji GCC (`-fopt-info-vec`):
+
+```bash
+g++ -O3 -std=c++17 -march=native -Iinclude -fopt-info-vec-optimized -c src/ikj.cpp -o /dev/null
+g++ -O3 -std=c++17 -march=native -Iinclude -fopt-info-vec-missed    -c src/naive.cpp -o /dev/null
+```
+
+```
+ikj.cpp:17:31: optimized: loop vectorized using 32 byte vectors
+ikj.cpp:17:31: optimized:  loop versioned for vectorization because of possible aliasing
+ikj.cpp:17:31: optimized: loop vectorized using 16 byte vectors
+naive.cpp:13:50: missed: not vectorized: not suitable for strided load
+```
+
+- **32 byte vectors**: pętla j liczy 8 floatów naraz (rejestr AVX2 `ymm`).
+- **16 byte vectors**: osobna, krótsza wersja na resztę, gdy `n` nie dzieli się przez 8.
+- **versioned because of possible aliasing**: kompilator nie wie, że wiersz C nie nakłada się
+  w pamięci na wiersz B (wskaźniki tego typu mogą wskazywać na ten sam obszar). Dlatego
+  generuje dwie wersje pętli i przed każdym jej uruchomieniem sprawdza adresy. Gdy obszary się
+  nie nakładają, a u nas tak jest zawsze, idzie wersja wektorowa. Sprawdzenie odbywa się raz na
+  wiersz (n² razy przy n³ pracy), więc kosztuje niewiele. Słowo `__restrict` by je usunęło, ale
+  to rozszerzenie kompilatora, a nie standard C++.
+- **naive: strided load**: kolumny B nie da się wczytać jednym odczytem wektorowym.
+- Zerowanie wiersza C kompilator zamienił na wywołanie `memset`.
+
+Gorąca pętla w asemblerze (`objdump -d build/CMakeFiles/matmul.dir/src/ikj.cpp.o`):
+
+```asm
+vbroadcastss %xmm1,%ymm2              ; a = A[i][k] skopiowane do 8 pozycji rejestru
+loop:
+vmovups      (%rax,%rdx),%ymm0        ; 8 floatów z wiersza B
+vfmadd213ps  (%rcx,%rdx),%ymm2,%ymm0  ; ymm0 = a * B + C (8 floatów C wczytane w tej samej instrukcji)
+vmovups      %ymm0,(%rcx,%rdx)        ; zapis 8 floatów C
+add          $0x20,%rdx               ; następne 32 B
+cmp / jne    loop
+```
+
+Na każdą iterację przypada 1 FMA (16 FLOP), 2 odczyty i 1 zapis. Pętla nie jest rozwinięta
+(GCC tego domyślnie nie robi), ale iteracje są od siebie niezależne, więc procesor nakłada
+kolejne na siebie i opóźnienie FMA (4 cykle) nie ogranicza tempa.
+
+### Wyniki (pomiar roboczy, 5 powtórzeń, mediana, 1 wątek)
+
+Warunki: zasilacz, tryb „Zrównoważony”, `clock_probe` przed i po: **~3,0 GHz** (2,85–3,10),
+bez spadku pod koniec. Szczyt przy tym zegarze: 32 × 3,0 ≈ 96 GFLOP/s. Naive i i-k-j zmierzone
+w jednym przebiegu.
+
+| N | naive | i-k-j | CV i-k-j | przyspieszenie | FLOP/cykl | % szczytu | hipoteza |
+|---|---|---|---|---|---|---|---|
+| 256 | 2,65 | **36,0** | 2,3% | **13,6×** | 12,0 | 38% | 20–30 |
+| 512 | 1,72 | **30,9** | 4,2% | **18×** | 10,3 | 32% | 15–25 |
+| 1000 | 2,68 | **18,0** | 8,4% | **6,7×** | 6,0 | 19% | 10–20 |
+| 1024 | 0,57 | **20,8** | 2,3% | **36×** | 6,9 | 22% | 10–20 |
+
+### Porównanie z hipotezą
+
+- **Jakościowo wszystko się zgadza.** Pętla jest zwektoryzowana (8 floatów, FMA), przepaść
+  między 1000 a 1024 zniknęła (18,0 i 20,8, różnica w granicach rozrzutu przy CV 8%),
+  przyspieszenie jest największe tam, gdzie wersja naiwna cierpiała najbardziej (1024: 36×).
+- **Dla 256 i 512 hipoteza była zbyt ostrożna.** Założenie: dostarczanie B z L2 będzie
+  hamulcem, bo saxpy w L2 dawał tylko ~17 GFLOP/s. Błąd w rozumowaniu: saxpy w L2 przepycha
+  przez L2 12 B na element (x, y i zapis y), a i-k-j tylko 4 B (sam wiersz B, bo wiersz C siedzi
+  w L1). Wynik dla 256 (36,0) to tyle, co saxpy w całości w L1 (33,8). **Przy N=256 położenie
+  danych przestało być ograniczeniem, ogranicza sama pętla.**
+- **Dla 1000/1024 lepiej sprawdziłby się prosty model niż szeroki przedział** (opisany niżej).
+
+### Model: przepustowość poziomu, na którym leży B
+
+Na każde FMA (2 FLOP) pętla wczytuje jeden float B (4 B) z poziomu, na którym leży B, czyli
+**0,5 FLOP na bajt** z tego poziomu. Wiersz C jest w L1 i prawie nic nie kosztuje. Górna
+granica to więc 0,5 × (przepustowość tego poziomu), ale nie więcej niż pozwala sama pętla.
+
+| N | B (rozmiar) | leży w | przepustowość (z saxpy, etap 0) | 0,5 × przepustowość | zmierzone |
+|---|---|---|---|---|---|
+| 256 | 256 KiB | L2 | ~106 GB/s | ~53 | 36,0, ogranicza pętla (≈ saxpy w L1) |
+| 1024 | 4 MiB | L3 | ~49 GB/s | ~24 | 20,8 (86% modelu) |
+
+Przy N=1024 i-k-j wyciąga z L3 ok. 20,8 / 2 × 4 B ≈ 42 GB/s, czyli prawie tyle, ile jeden rdzeń
+może pobrać z L3. To pierwsze zetknięcie z modelem **roofline**: osiągalne GFLOP/s =
+min(możliwości obliczeniowe, AI × przepustowość pamięci). Rozwiniemy go w etapie 5.
+
+Wniosek na etap 3: dla N=1024 ograniczeniem jest to, że **cała macierz B przejeżdża z L3
+osobno dla każdego wiersza i**. Kafelkowanie (tiling) ma sprawić, że kawałek B wczytany raz
+zostanie użyty dla wielu wierszy, zanim wypadnie z cache. Dla N=256 kafelkowanie niewiele da,
+bo tam B już siedzi w L2, a ogranicza pętla.
+
+### Dlaczego i-k-j nie dojdzie do szczytu
+
+Na każde FMA przypadają 3 operacje na pamięci: odczyt B, odczyt C i zapis C. Według
+dokumentacji mikroarchitektury (nie mierzyliśmy tego) rdzeń P wykonuje na cykl do 2 FMA,
+ale tylko ok. 3 odczyty i 2 zapisy wektorowe. Przy 2 odczytach na FMA odczyty pozwalają na
+najwyżej 1,5 FMA na cykl, i to w idealnym przypadku. W praktyce ten kształt pętli (saxpy w L1)
+osiąga ok. 12 FLOP/cykl na 32 możliwe.
+
+Wiersz C jest wczytywany i zapisywany przy **każdym** k, choć tak naprawdę wystarczyłoby
+wczytać go raz i zapisać raz. Rozwiązaniem jest trzymanie fragmentu C w rejestrach przez wiele
+kolejnych k (*register blocking*). Tak robią mikrojądra bibliotek BLAS (etap 6). Sama zmiana
+położenia danych tego nie naprawi.
+
+### Bit w bit z wersją naiwną: tylko 19–67% elementów
+
+i-k-j dodaje składniki w tej samej kolejności co wersja naiwna, a mimo to większość wyników
+różni się na ostatnich bitach:
+
+| n | 1 | 2 | 7 | 16 | 64 | 256 |
+|---|---|---|---|---|---|---|
+| identyczne z naive | 100% | 100% | 67% | 42% | 27% | 19% |
+
+Przyczyna to FMA. W i-k-j każdy krok to `vfmadd`: `c + a·b` liczone dokładnie i zaokrąglane
+**raz**. Główna pętla wersji naiwnej mnoży (`vmulps`) i dodaje (`vaddss`) osobno, czyli
+zaokrągla **dwa razy**. Dla n = 1 i 2 wersja naiwna działa wyłącznie w pętli dla reszty
+(n mod 4), która też używa FMA, stąd 100%. GCC dla C++ domyślnie łączy `a*b + c` w FMA
+(`-ffp-contract=fast`), gdy tylko może.
+
+Wnioski:
+- Ta sama kolejność sumowania nie wystarcza do identycznych bitów. Liczą się też instrukcje,
+  które wybierze kompilator. Dlatego testy zawsze używają tolerancji.
+- FMA nie pogarsza dokładności, raczej ją poprawia (jedno zaokrąglenie zamiast dwóch). Błąd
+  względem `double` jest u obu wersji tego samego rzędu (~2·10⁻⁷ dla n=256). Różnica
+  i-k-j − naive dla n=256 to najwyżej 9·10⁻⁸ × Σ|a·b|, przy tolerancji 6·10⁻⁵.
+
+### Ponowny pomiar wersji naiwnej: dryf między sesjami
+
+| N | etap 1 (2,84 GHz) | etap 2 (~3,0 GHz) | zmiana |
+|---|---|---|---|
+| 256 | 2,28 | 2,65 | +16% |
+| 512 | 1,47 | 1,72 | +17% |
+| 1000 | 2,27 | 2,68 | +18% |
+| 1024 | 0,35 | 0,57 | **+63%** |
+
+Zegar wzrósł o ok. 6%, a wyniki o 16–63%. Rozrzut wewnątrz każdej sesji (CV 2–9%, poza 512)
+jest dużo mniejszy niż różnica między sesjami. Możliwe przyczyny, których nie da się rozdzielić
+bez liczników sprzętowych:
+- benchmark mógł działać przy innym zegarze niż w chwili pomiaru `clock_probe`;
+- inne obciążenie systemu (teraz load average 0,42, w etapie 1 VS Code był aktywny);
+- dla 1024, czyli dla pracy ograniczonej przez L3, także zegar części procesora poza rdzeniami
+  (*uncore*: L3 i szyna łącząca rdzenie), którym Windows steruje niezależnie.
+
+**Lekcja: wersje porównujemy tylko w obrębie jednego przebiegu.** Dlatego naive jest mierzone
+ponownie razem z każdą nową wersją, a liczby do README powstaną w jednej sesji, w ustalonych
+warunkach.
+
+### Testy po przebudowie
+
+Testy są teraz sparametryzowane listą kerneli (`kAllKernels`). Nowa wersja to jedna linijka
+i od razu dostaje komplet testów:
+- `KernelBasics` (2×2 policzone ręcznie, macierz jednostkowa, NaN w C) dla każdej wersji;
+- `KernelVsExact`: błąd względem `double` ≤ n·eps·Σ|a·b|, 8 rozmiarów;
+- `KernelVsNaive`: każda wersja poza naive porównana z naive, tolerancja 2·n·eps·Σ|a·b|.
+  Skoro obie mieszczą się w n·eps·Σ|a·b| od wartości dokładnej, to od siebie dzieli je najwyżej
+  dwa razy tyle (nierówność trójkąta). Naive jest wzorcem, bo jego poprawność widać
+  z samego kodu, a dodatkowo sam jest sprawdzany względem `double`.
+
+`OverwritesC` jest teraz naprawdę potrzebny. i-k-j dodaje do C, więc kernel, który zapomniałby
+wyzerować wiersz, dałby w wyniku NaN.
+
+### Nowe narzędzie: `clock_probe`
+
+`./build/clock_probe` mierzy zegar rdzenia i opóźnienia `vaddss`/`vfmadd231ss` metodą
+proporcji opisaną w etapie 1. Uruchamiamy go przed i po każdej serii pomiarów.

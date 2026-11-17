@@ -33,11 +33,16 @@ void BM_Matmul(benchmark::State& state, Kernel kernel) {
         benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate);
 }
 
-BENCHMARK_CAPTURE(BM_Matmul, naive, matmul::naive)
-    ->Arg(256)
-    ->Arg(512)
-    ->Arg(1000)  // non-power-of-two control size (cache set conflicts at 1024)
-    ->Arg(1024)
-    ->Unit(benchmark::kMillisecond);
+// The same sizes for every version. 1000 is a non-power-of-two control size: at 1024 the
+// column stride of B is exactly 4 KiB, which causes cache set conflicts in the naive loop.
+void Sizes(benchmark::internal::Benchmark* b) {
+    for (int n : {256, 512, 1000, 1024}) {
+        b->Arg(n);
+    }
+    b->Unit(benchmark::kMillisecond);
+}
+
+BENCHMARK_CAPTURE(BM_Matmul, naive, matmul::naive)->Apply(Sizes);
+BENCHMARK_CAPTURE(BM_Matmul, ikj, matmul::ikj)->Apply(Sizes);
 
 }  // namespace
