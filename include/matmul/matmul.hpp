@@ -15,4 +15,9 @@ void naive(const float* A, const float* B, float* C, int n);
 // so every access is contiguous and the loop vectorizes without reordering the sum.
 void ikj(const float* A, const float* B, float* C, int n);
 
+// Version 3: blocked (tiled) i-k-j. C is computed tile by tile from the block formula
+// C_IJ = sum_K A_IK * B_KJ with tile x tile blocks; each block product runs in i-k-j order.
+// Edge tiles are smaller when tile does not divide n. Throws std::invalid_argument if tile < 1.
+void tiled(const float* A, const float* B, float* C, int n, int tile);
+
 }  // namespace matmul

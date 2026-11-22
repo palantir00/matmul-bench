@@ -19,9 +19,13 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
 fi
 
 mkdir -p results
+# Random interleaving runs the repetitions of all selected benchmarks in random order,
+# so a slow phase of the machine (clock drop, background task) is spread over all
+# variants instead of ruining one of them.
 ./build/matmul_bench \
     --benchmark_filter="$filter" \
     --benchmark_repetitions="$reps" \
+    --benchmark_enable_random_interleaving=true \
     --benchmark_display_aggregates_only=true \
     --benchmark_context=commit="$commit" \
     --benchmark_out="results/${name}.json" \

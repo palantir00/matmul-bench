@@ -47,7 +47,8 @@ endif()
 # ---- Library ----------------------------------------------------------------
 add_library(matmul
   src/naive.cpp
-  src/ikj.cpp)
+  src/ikj.cpp
+  src/tiled.cpp)
 target_include_directories(matmul PUBLIC include)
 target_link_libraries(matmul PUBLIC matmul_flags)
 

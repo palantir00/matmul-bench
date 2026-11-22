@@ -549,3 +549,185 @@ wyzerować wiersz, dałby w wyniku NaN.
 
 `./build/clock_probe` mierzy zegar rdzenia i opóźnienia `vaddss`/`vfmadd231ss` metodą
 proporcji opisaną w etapie 1. Uruchamiamy go przed i po każdej serii pomiarów.
+
+---
+
+## Etap 3: kafelkowanie (tiling)
+
+### Problem z etapu 2
+
+Dla N=1024 i-k-j przy każdym wierszu `i` przechodzi przez **całą** macierz B (4 MiB, czyli
+z L3). Każdy element B jest więc wczytywany z L3 n razy, łącznie n³ floatów. Pętla jest
+ograniczona przepustowością L3 (~42 GB/s).
+
+### Pomysł: wzór blokowy
+
+Dzielimy macierze na kafelki T×T. Mnożenie macierzy działa tak samo na blokach, jak na liczbach:
+
+```
+C_IJ = Σ_K  A_IK · B_KJ            (I, J, K: numery kafelków)
+```
+
+```
+for ii:                       ─┐
+  for jj:                      │ wybór kafelka C(ii,jj)
+    for kk:                    │ C(ii,jj) += A(ii,kk) · B(kk,jj)
+      for i in kafelek:        ─┤
+        for k in kafelek:       │ wewnątrz: to samo i-k-j co w etapie 2,
+          for j in kafelek:     │ tylko na kawałku T×T
+            C[i][j] += A[i][k] * B[k][j]
+```
+
+```
+           B                               kafelek B(kk,jj) wczytany raz
+     ┌────┬────┬────┐                      jest używany przez T kolejnych
+     │    │    │    │                      wierszy i (w i-k-j: przez jeden)
+     ├────┼────┼────┤
+  kk │    │ ██ │    │  ◄── T×T, mieści się w L1/L2
+     ├────┼────┼────┤
+     │    │    │    │
+     └────┴────┴────┘
+             jj
+```
+
+**Ruch B z L3** spada z n³ do n³/T floatów. Dla N=1024 i T=128: z 4 GiB do 32 MiB.
+
+**Kolejność sumowania się nie zmienia.** kk rośnie w pętli zewnętrznej, k rośnie wewnątrz
+kafelka, więc każde `C[i][j]` dostaje składniki w kolejności k = 0…n−1. Wynik jest identyczny
+z i-k-j bit w bit dla każdego T. Sprawdza to test `Tiled.BitIdenticalToIkj`.
+
+| T | kafelek B | kafelki A+B+C | gdzie się mieszczą |
+|---|---|---|---|
+| 16 | 1 KiB | 3 KiB | L1 |
+| 32 | 4 KiB | 12 KiB | L1 |
+| 64 | 16 KiB | 48 KiB | L1 na styk (48 KiB) |
+| 128 | 64 KiB | 192 KiB | L2 |
+| 256 | 256 KiB | 768 KiB | L2 (60% pojemności) |
+
+### Hipoteza przed pomiarem
+
+1. N=1000/1024: z ~20 do 28–36 GFLOP/s (~1,5× względem i-k-j).
+2. Sufit ~36 GFLOP/s: pętla wewnętrzna ma ten sam kształt co w i-k-j.
+3. T=16 tylko ~10–15 GFLOP/s, bo pętla j ma 2 iteracje wektorowe i narzut ich nie zamortyzuje.
+4. Optimum T ≈ 64–128.
+5. N=256: kafelkowanie nie pobije i-k-j.
+6. N=1024 może tracić względem 1000, bo wiersze kafla leżą co 4 KiB (konflikty zbiorów).
+7. Wyniki bit w bit takie jak w i-k-j.
+
+### Metodologia: trzy poprawki w trakcie etapu
+
+- **Czas zegarowy zamiast czasu CPU** (`UseRealTime()`). W pierwszym przebiegu kolumna `Time`
+  była o ~5% większa od `CPU`. Google Benchmark domyślnie liczy GFLOP/s z czasu CPU, który nie
+  obejmuje chwil, gdy system odebrał wątkowi rdzeń. Uczciwy jest czas zegarowy. W etapie 4 czas
+  CPU byłby wręcz błędny, bo przy wielu wątkach to suma czasów wszystkich wątków.
+- **Losowe przeplatanie powtórzeń** (`--benchmark_enable_random_interleaving`, teraz domyślnie
+  w `run_bench.sh`). Powtórzenia wszystkich wariantów idą w losowej kolejności, więc chwilowe
+  spowolnienie maszyny rozkłada się na wszystkie warianty, zamiast zepsuć jeden.
+- **Trzy niezależne przebiegi**, a tabela pochodzi z ostatniego (7 powtórzeń, przeplatanie).
+  Zegar w tej sesji: ~2,8 GHz, szczyt 32 × 2,8 ≈ 90 GFLOP/s.
+
+### Wyniki (GFLOP/s, mediana, czas zegarowy, 1 wątek)
+
+| N | naive | i-k-j | T=16 | T=32 | T=64 | **T=128** | T=256 |
+|---|---|---|---|---|---|---|---|
+| 256 | 2,4 | 24,2 | 11,9 | 18,2 | 24,6 | **30,7** | 23,6 |
+| 512 | 1,7 | 27,0 | 11,4 | 16,7 | 22,9 | **28,5** | 23,3 |
+| 1000 | 2,5 | 19,1 | 9,9 | 16,2 | 24,5 | **26,6** | 22,3 |
+| 1024 | 0,44 | 18,7 | 10,3 | 14,2 | 21,2 | **24,4** | 21,0 |
+
+CV w ostatnim przebiegu: 1–6%, wyjątki: i-k-j 1024 10%, naive 512 12%, T=16 przy 1024 10%.
+
+Najlepsze T=128 względem poprzednich wersji:
+
+| N | vs i-k-j | vs naive |
+|---|---|---|
+| 256 | 1,27× (ale i-k-j jest tu niestabilne, patrz niżej) | 13× |
+| 512 | 1,06× | 17× |
+| 1000 | **1,39×** | 11× |
+| 1024 | **1,30×** | **55×** |
+
+### Porównanie z hipotezą
+
+| | hipoteza | wynik | |
+|---|---|---|---|
+| 1 | 1000/1024: 28–36 GFLOP/s, ~1,5× | 26,6 / 24,4, czyli 1,3–1,4× | kierunek ✓, liczby za optymistyczne |
+| 2 | sufit ~36 | żaden wariant nie przekroczył ~31 | ✓ |
+| 3 | T=16: 10–15 | 10–12 | ✓ |
+| 4 | optimum 64–128 | 128 dla każdego N, a 64 wyraźnie gorsze | częściowo ✓ |
+| 5 | N=256: nie lepiej niż i-k-j | w 2 z 3 przebiegów T=128 wygrało z i-k-j o 27% | ✗ (niestabilność, niżej) |
+| 6 | 1024 traci względem 1000 | −13% przy T=64, −8% przy T=128 | ✓, efekt umiarkowany |
+| 7 | bit w bit = i-k-j | test przechodzi | ✓ |
+
+### Główna lekcja: kafelkowanie to kompromis, a koszt da się zmierzyć
+
+Dla N=256 kafelkowanie **nie ma czego naprawiać**, bo całe A, B i C mieszczą się w L2.
+Spadek przy małym T to więc czysty koszt kafelkowania. To kontrolowany eksperyment.
+
+Koszt bierze się z tego, że pętla j ma długość T, a nie n. Każde jej uruchomienie ma stały
+narzut: ustawienie pętli, sprawdzenie aliasingu, broadcast `a`, wyjście z pętli. Czas jednego
+uruchomienia wyliczony z pomiarów, t(T) = 2T / GFLOP/s [ns]:
+
+| T | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|
+| t(T) zmierzone | 2,69 ns | 3,52 ns | 5,20 ns | 8,34 ns |
+| model 1,88 + 0,0504·T | 2,69 | 3,49 | 5,11 | 8,33 |
+
+Prosta pasuje z dokładnością do 2%. Przy ~2,8 GHz oznacza to:
+- **~5 cykli stałego narzutu** na każde uruchomienie pętli j;
+- **~1,1 cyklu na 8 floatów** (jedna iteracja wektorowa) pracy właściwej.
+
+Dla T=16 pętla ma 2 iteracje wektorowe, czyli ~2,3 cyklu pracy na ~5,3 cyklu narzutu, więc
+tylko 30% czasu idzie na obliczenia. Gdyby narzutu nie było, pętla dawałaby
+2 / 0,0504 ≈ **40 GFLOP/s**. T=128 osiąga 77% tej wartości.
+
+Porównanie N=1000 z N=256 przy tym samym T rozdziela oba efekty:
+- **T=64: 24,5 wobec 24,6.** Dla N=1000 przy T=64 problem pamięci jest rozwiązany całkowicie,
+  a limitem jest wyłącznie narzut krótkiej pętli.
+- **T=128: 26,6 wobec 30,7.** Narzut jest mniejszy, ale pojawia się ~13% kosztu po stronie
+  pamięci. Prawdopodobnie to wczytywanie nowych kafelków z L3 na początku każdego mnożenia
+  kafelków. Prefetcher widzi krótkie strumienie (wiersz kafla to 512 B), a nie jeden ciągły.
+  Bez liczników sprzętowych tego nie potwierdzimy.
+- **1024 vs 1000** (−8% do −13%): wiersze kafla co 4 KiB wpadają do tych samych zbiorów cache,
+  ten sam mechanizm co kolumna w etapie 1, tylko łagodniejszy.
+
+Wnioski:
+- Reguła „wybierz największy kafelek, który mieści się w L1” tutaj zawodzi. T=64 mieści się
+  w L1, a przegrywa z T=128, bo **w tej konstrukcji T to także długość pętli wewnętrznej**.
+- Lepsza konstrukcja rozdziela te dwie rzeczy: kafelki prostokątne (długie w j, krótkie w k
+  i i) albo osobne rozmiary bloków dla każdego poziomu cache. Tak robią biblioteki BLAS
+  (bloki m_c, k_c, n_c w algorytmie Goto).
+- Sufit ~40 GFLOP/s wynika z kształtu pętli (2 odczyty + 1 zapis na FMA). Żaden rozmiar kafla go
+  nie podniesie. Potrzebne jest trzymanie fragmentu C w rejestrach (mikrojądro, etap 6).
+
+### Niestabilność wariantów z pętlą długości 256
+
+Wartości z trzech przebiegów, przeliczone na czas zegarowy:
+
+| wariant | przebieg 1 | przebieg 2 | przebieg 3 |
+|---|---|---|---|
+| i-k-j, N=256 | 31,3 | 23,7 | 24,2 |
+| T=256, N=256 | 30,8 | 22,4 | 23,6 |
+| T=256, N=1000 | 27,1 | 22,9 | 22,3 |
+| T=128, N=256 | 30,4 | 30,2 | 30,7 |
+| T=64, N=1000 | 24,8 | 24,7 | 24,5 |
+
+Wszystkie warianty z T ≤ 128 zgadzają się między przebiegami w granicach ~5%. Warianty, w których
+pętla j ma 256 elementów, wahają się od ~22 do ~36 GFLOP/s (36 dał i-k-j w etapie 2 i w osobnym
+programie testowym). Spadek zegara albo przeniesienie wątku na rdzeń E spowolniłyby wszystkie
+warianty, a nie tylko te.
+
+Sprawdzone hipotezy:
+1. *4K aliasing między wierszem C a wierszem B.* Program testowy przesuwał C względem B co
+   256 B (16 przesunięć, 2 przebiegi). Brak systematycznej zależności, wahania ±3 to szum.
+   **Odrzucona.**
+2. *Kolorowanie stron.* L2 wybiera zbiór na podstawie fizycznego adresu, a strony 4 KiB system
+   przydziela w przypadkowych miejscach, inaczej w każdym procesie. Test: 5 procesów na stronach
+   4 KiB i 5 na stronach 2 MiB (fizycznie ciągłych). Na stronach 4 KiB tym razem wszystkie procesy
+   dały ~36. Na stronach 2 MiB wynik nie stał się stabilniejszy, a T=128 spadło do ~27.
+   Prawdopodobnie przez sam układ eksperymentu: A, B i C leżały co 1 MiB w fizycznie ciągłej
+   pamięci, więc trafiały do tych samych zbiorów L2. **Nierozstrzygnięta.**
+
+Przyczyna pozostaje otwarta. Do jej znalezienia potrzebne są liczniki sprzętowe (`perf` na
+natywnym Linuksie: chybienia L1/L2, blokady przy odczytach). Wniosek z etapu 2, że i-k-j dla
+N=256 ogranicza wyłącznie pętla, trzeba osłabić, bo zdarzają się sesje z wynikiem ~24.
+Praktyczny wniosek: T=128 daje podobny najlepszy wynik i jest **przewidywalne**, a to też zaleta.

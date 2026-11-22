@@ -7,6 +7,7 @@
 #include <limits>
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -29,9 +30,16 @@ void PrintTo(const KernelCase& k, std::ostream* os) { *os << k.name; }
 
 // Every kernel version, naive first. A new version needs one line here and is then
 // covered by all parametrized tests below.
+// Kernels with an extra parameter are wrapped in captureless lambdas, which convert to a
+// plain function pointer. Tile sizes 1 and 3 divide almost none of the test sizes, so
+// they exercise the smaller edge tiles; 64 is larger than the small matrices.
 const KernelCase kAllKernels[] = {
     {"naive", matmul::naive},
     {"ikj", matmul::ikj},
+    {"tiled_t1", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 1); }},
+    {"tiled_t3", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 3); }},
+    {"tiled_t16", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 16); }},
+    {"tiled_t64", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 64); }},
 };
 
 // Different seeds for A and B: with A == B, a kernel that computes B * A instead of A * B
@@ -245,6 +253,35 @@ INSTANTIATE_TEST_SUITE_P(Sizes, KernelVsNaive,
                                                  std::end(kAllKernels)),
                              ::testing::ValuesIn(kSizes)),
                          kernel_size_name);
+
+// ---- Tiled-specific -----------------------------------------------------------
+
+// Tiling in the ii-jj-kk order does not reorder the sum: every C[i][j] still gets its
+// terms in order k = 0..n-1, each as one fused multiply-add, exactly as in ikj. So the
+// results must be identical bit for bit, for any tile size. (This relies on both kernels
+// being built with the same flags, so that both use FMA or both do not.)
+TEST(Tiled, BitIdenticalToIkj) {
+    for (int n : {127, 256}) {
+        Matrix A(n), B(n), R(n), C(n);
+        A.fill_random(kSeedA);
+        B.fill_random(kSeedB);
+        matmul::ikj(A.data(), B.data(), R.data(), n);
+        for (int tile : {1, 3, 16, 64, 100, 256}) {
+            matmul::tiled(A.data(), B.data(), C.data(), n, tile);
+            std::size_t mismatches = 0;
+            for (std::size_t idx = 0; idx < C.size(); ++idx) {
+                mismatches += (C.data()[idx] != R.data()[idx]) ? 1 : 0;
+            }
+            EXPECT_EQ(mismatches, 0u) << "n=" << n << " tile=" << tile;
+        }
+    }
+}
+
+TEST(Tiled, RejectsNonPositiveTile) {
+    Matrix A(4), B(4), C(4);
+    EXPECT_THROW(matmul::tiled(A.data(), B.data(), C.data(), 4, 0), std::invalid_argument);
+    EXPECT_THROW(matmul::tiled(A.data(), B.data(), C.data(), 4, -8), std::invalid_argument);
+}
 
 // ---- The check itself ---------------------------------------------------------
 // It must be strict enough to catch a real bug, e.g. one forgotten term of a sum
