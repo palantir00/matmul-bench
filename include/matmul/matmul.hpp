@@ -20,4 +20,17 @@ void ikj(const float* A, const float* B, float* C, int n);
 // Edge tiles are smaller when tile does not divide n. Throws std::invalid_argument if tile < 1.
 void tiled(const float* A, const float* B, float* C, int n, int tile);
 
+// How OpenMP hands out the C tiles to threads.
+enum class Schedule {
+    Static,   // each thread gets an equal, fixed share of the tiles up front
+    Dynamic,  // a thread takes the next tile whenever it finishes one
+};
+
+// Version 4: tiled, multithreaded with OpenMP. Every C tile is one task computed by one
+// thread from start to end, so threads never write to the same memory and every element
+// gets its terms in the same order as in ikj (results are identical for any thread count).
+// Throws std::invalid_argument if tile < 1 or threads < 1.
+void tiled_omp(const float* A, const float* B, float* C, int n, int tile, int threads,
+               Schedule schedule = Schedule::Dynamic);
+
 }  // namespace matmul

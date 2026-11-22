@@ -53,4 +53,39 @@ BENCHMARK(BM_Saxpy)
     ->Arg(1024 * 1024)        //   8 MiB -> fits L3 (24 MiB)
     ->Arg(16 * 1024 * 1024);  // 128 MiB -> DRAM
 
+// The same saxpy split over threads (each thread gets one contiguous chunk). On a DRAM-sized
+// working set this measures how much memory bandwidth several cores can pull together,
+// which is the "memory roof" for the roofline model in stage 5.
+void saxpy_omp(float a, const float* x, float* y, std::ptrdiff_t n, int threads) {
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (std::ptrdiff_t i = 0; i < n; ++i) {
+        y[i] = a * x[i] + y[i];
+    }
+}
+
+void BM_SaxpyOmp(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    const int threads = static_cast<int>(state.range(1));
+    auto x = matmul::alloc_aligned(n);
+    auto y = matmul::alloc_aligned(n);
+    std::fill(x.get(), x.get() + n, 1.0f);
+    std::fill(y.get(), y.get() + n, 0.0f);
+
+    for (auto _ : state) {
+        saxpy_omp(0.5f, x.get(), y.get(), static_cast<std::ptrdiff_t>(n), threads);
+        benchmark::DoNotOptimize(y.get());
+        benchmark::ClobberMemory();
+    }
+
+    state.counters["FLOPS"] = benchmark::Counter(
+        2.0 * static_cast<double>(n), benchmark::Counter::kIsIterationInvariantRate);
+    state.SetBytesProcessed(static_cast<std::int64_t>(state.iterations()) *
+                            static_cast<std::int64_t>(n * 3 * sizeof(float)));
+}
+
+BENCHMARK(BM_SaxpyOmp)
+    ->ArgNames({"n", "threads"})
+    ->ArgsProduct({{16 * 1024 * 1024}, {1, 2, 4, 6, 8, 10, 16}})
+    ->UseRealTime();  // by default CPU time would cover only the main thread
+
 }  // namespace

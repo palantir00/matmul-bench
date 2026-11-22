@@ -619,7 +619,11 @@ z i-k-j bit w bit dla każdego T. Sprawdza to test `Tiled.BitIdenticalToIkj`.
 - **Czas zegarowy zamiast czasu CPU** (`UseRealTime()`). W pierwszym przebiegu kolumna `Time`
   była o ~5% większa od `CPU`. Google Benchmark domyślnie liczy GFLOP/s z czasu CPU, który nie
   obejmuje chwil, gdy system odebrał wątkowi rdzeń. Uczciwy jest czas zegarowy. W etapie 4 czas
-  CPU byłby wręcz błędny, bo przy wielu wątkach to suma czasów wszystkich wątków.
+  CPU byłby wręcz mylący: Google Benchmark domyślnie mierzy czas CPU tylko głównego wątku
+  (z `MeasureProcessCPUTime()` byłaby to suma po wszystkich wątkach), a nas interesuje, ile
+  czeka się na wynik. *(Sprostowanie z etapu 4: pierwotnie było tu napisane, że domyślny czas
+  CPU to suma po wątkach. Pomiar przy 16 wątkach pokazał CPU ≈ Time, czyli tylko główny
+  wątek.)*
 - **Losowe przeplatanie powtórzeń** (`--benchmark_enable_random_interleaving`, teraz domyślnie
   w `run_bench.sh`). Powtórzenia wszystkich wariantów idą w losowej kolejności, więc chwilowe
   spowolnienie maszyny rozkłada się na wszystkie warianty, zamiast zepsuć jeden.
@@ -731,3 +735,188 @@ Przyczyna pozostaje otwarta. Do jej znalezienia potrzebne są liczniki sprzętow
 natywnym Linuksie: chybienia L1/L2, blokady przy odczytach). Wniosek z etapu 2, że i-k-j dla
 N=256 ogranicza wyłącznie pętla, trzeba osłabić, bo zdarzają się sesje z wynikiem ~24.
 Praktyczny wniosek: T=128 daje podobny najlepszy wynik i jest **przewidywalne**, a to też zaleta.
+
+---
+
+## Etap 4: wiele wątków (OpenMP)
+
+### Kod: jeden kafelek C = jedno zadanie
+
+```cpp
+#pragma omp parallel for collapse(2) schedule(dynamic) num_threads(threads)
+for (int ti = 0; ti < tiles; ++ti)
+    for (int tj = 0; tj < tiles; ++tj)
+        compute_c_tile(A, B, C, n, tile, ti * tile, tj * tile);  // zeruje i liczy cały kafelek
+```
+
+```
+         C (N=1024, T=128 → 8×8 = 64 zadania)
+   ┌──┬──┬──┬──┬──┬──┬──┬──┐
+   │w0│w1│w2│w3│w4│w5│w0│..│   wątek bierze kafelek, liczy go od zera do końca
+   ├──┼──┼──┼──┼──┼──┼──┼──┤   (wszystkie kk), bierze następny
+   │  │  │  │  │  │  │  │  │
+   └──┴──┴──┴──┴──┴──┴──┴──┘
+```
+
+- **Nie ma wyścigów (data race).** Wątki piszą do rozłącznych kafelków C, a A i B tylko czytają.
+  Nie potrzeba blokad ani operacji atomowych.
+- **Wynik jest identyczny bit w bit z i-k-j dla każdej liczby wątków.** Każdy element liczy jeden
+  wątek, w tej samej kolejności k. Test `TiledOmp.BitIdenticalToIkjForAnyThreadCount`
+  sprawdza 1, 2, 3, 7 i 16 wątków, oba sposoby podziału i dwa rozmiary kafla. Gdyby dwa wątki
+  pisały do tego samego kafelka albo jakiś kafelek został pominięty, test by to wykazał.
+- **Zerowanie C też jest w wątkach** (każdy zeruje swój kafelek), więc nie ma części szeregowej
+  poza samym uruchomieniem i zakończeniem regionu równoległego.
+- **`collapse(2)`** łączy siatkę kafelków w jedną listę zadań: 64 zamiast 8 przy podziale samych
+  wierszy kafelków. Inaczej przy N=1024 i T=128 pracować mogłoby najwyżej 8 wątków.
+- **`static`**: każdy wątek dostaje z góry równą porcję kafelków. **`dynamic`**: wątek bierze
+  następny kafelek, gdy skończy poprzedni. Na procesorze hybrydowym (P + E) `static` każe
+  szybkim rdzeniom czekać na wolne.
+
+### Pojęcia
+
+```
+przyspieszenie   S(p) = T(1) / T(p)
+efektywność      E(p) = S(p) / p
+prawo Amdahla    S(p) ≤ 1 / (s + (1 − s)/p)        s = część szeregowa programu
+Karp–Flatt       e = (1/S − 1/p) / (1 − 1/p)        „efektywna część szeregowa” z pomiaru
+```
+
+Przykład: przy s = 1% maksymalne S(6) = 5,7, a S(16) = 13,9. U nas część szeregowa to tylko
+uruchomienie wątków (mikrosekundy przy ~90 ms pracy), więc s ≈ 0,01%, a **Amdahl nie jest
+ograniczeniem**. Prawo Amdahla zakłada jednakowe procesory o stałej szybkości. Tutaj oba
+założenia są fałszywe: rdzenie są różne (P, E, rodzeństwo HT) i zwalniają, gdy więcej z nich
+pracuje (limit mocy). Karp–Flatt wrzuca wszystkie te straty do jednej liczby e.
+
+**HT (hyperthreading):** dwa wątki sprzętowe jednego rdzenia dzielą jego jednostki wykonawcze
+i cache L1/L2. Pomaga, gdy jeden wątek zostawia jednostki bezczynne (czeka na pamięć albo na
+wynik w łańcuchu zależności, jak wersja naiwna). Nie pomaga, gdy pętla już dociąża porty
+odczytu/zapisu, jak nasza.
+
+### Hipoteza przed pomiarem (N=1024, T=128)
+
+| wątki | przewidywanie |
+|---|---|
+| 2, 4 | 1,9×, 3,5× |
+| 6 (wszystkie P) | ~5×, ~120 GFLOP/s (zegar spada pod limitem mocy) |
+| 8, 10 (+ rdzenie E) | ~6×, 140–150 |
+| 12, 16 (HT) | ±10% względem 10 |
+| `static` przy 10 | wolniejsze niż przy 6 (rdzenie E hamują rdzenie P) |
+| saxpy w DRAM | nasycenie przy 2–4 wątkach, ~30–40 GB/s |
+
+### Wyniki: przegląd liczby wątków (7 powtórzeń, przeplatanie, mediana i CV)
+
+Warunki: tryb „Zrównoważony”, zasilacz, `clock_probe` przed i po: ~2,9–3,1 GHz (1 rdzeń).
+
+N=1024, GFLOP/s:
+
+| wątki | 1 | 2 | 4 | 6 | 8 | 10 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|
+| T=128 dynamic | 24,0 | 49,2 | 82,5 | 96,2 | 107,5 | 113,4 | 93,7 | 82,7 |
+| CV | 6% | 5% | 10% | 13% | 12% | 18% | 19% | 18% |
+| T=128 static | 25,1 | 49,3 | 76,9 | 81,3 | 72,5 | 86,2 | 84,4 | 76,5 |
+| T=64 dynamic | 22,9 | 43,9 | 72,7 | 96,5 | 99,2 | 72,3 | 88,1 | 80,2 |
+
+N=1000 wygląda podobnie: 4 wątki ~81–92, potem 77–102 bez wyraźnego trendu, CV 6–19%.
+
+Punkty odniesienia z tego samego przebiegu (1 wątek): i-k-j 20,0, kafelkowanie szeregowe T=128
+**28,0**. Wersja OpenMP na 1 wątku jest ~8–13% wolniejsza od szeregowej. Pętla wewnętrzna jest
+zwektoryzowana identycznie, osobny pomiar (9 powtórzeń) potwierdza różnicę, a przyczyny nie
+udało się ustalić. Dlatego przyspieszenie liczymy względem najlepszej wersji
+szeregowej, a nie względem wersji równoległej na 1 wątku. To częsty sposób na „podkręcanie”
+wyników skalowania.
+
+Co jest pewne mimo szumu:
+- **1 → 2 wątki: 2,0×** (CV ≤ 6%). **4 wątki: 3,1–3,7×.**
+- **Powyżej 4–6 wątków wynik stoi na 80–115 GFLOP/s** z rozrzutem 10–20%.
+- **12 i 16 wątków są wolniejsze niż 6–10.**
+- Różnice static/dynamic i 6/8/10 wątków są **w granicach szumu**, więc tego nie rozstrzygamy.
+
+### Diagnoza: gdzie Windows kładzie wątki i z jakim zegarem
+
+Z wnętrza WSL tego nie widać: Linux widzi 16 wirtualnych procesorów i nie wie, które są P,
+które E, ani które są parą HT. Liczniki wydajności po stronie Windows
+(`Win32_PerfFormattedData_Counters_ProcessorInformation`) pokazują obciążenie i częstotliwość
+każdego procesora logicznego. Procesory 0–11 to rdzenie P (pary HT: 0/1, 2/3, …), a 12–15 to
+rdzenie E. Długi pomiar (9 s) dla każdej liczby wątków, z odczytem liczników w trakcie:
+
+| wątki | gdzie pracowały wątki | zegar P (wg Windows) | GFLOP/s |
+|---|---|---|---|
+| 0 (tło) | kilka procesorów zajętych w 10–80% przez inne programy | ~0,6–1 GHz | – |
+| 1 | na zmianę procesory 5 i 6 (dwa różne rdzenie) | ~2,6 GHz | 23,3 |
+| 4 | 4–6 różnych rdzeni P (procesory parzyste) | ~3,1 GHz | 92,3 |
+| 6 | **po jednym wątku na każdym z 6 rdzeni P**, rdzenie E wolne | ~3,1 GHz | **118,2** |
+| 10 | rdzenie P **razem z rodzeństwem HT**, rdzenie E zajęte w ~50% | ~2,65 GHz | 91,4 |
+| 16 | wszystkie procesory logiczne w 100% | **~2,0 GHz** | 66,0 |
+
+Zegar wyliczono jako „Processor Frequency × % Processor Performance”. Traktujemy go jako
+trend, a nie dokładną wartość.
+
+Wnioski:
+- **Przy dobrym rozłożeniu wątków hipoteza się sprawdza:** 6 wątków na 6 rdzeniach P daje
+  118,2 GFLOP/s, czyli 5,1× względem wersji OpenMP na 1 wątku i 4,2× względem kafelkowania
+  szeregowego. Karp–Flatt: e = (1/5,07 − 1/6)/(1 − 1/6) ≈ 3,7%. To nie jest kod szeregowy, tylko
+  niższy zegar i wspólne L3.
+- **Przegląd z 7 powtórzeniami dał przy 6 wątkach tylko 96** (CV 13%). Rozłożenie wątków nie
+  jest za każdym razem idealne, a tło systemu zabiera procesory.
+- **Powyżej 6 wątków Windows używa rodzeństwa HT na rdzeniach P, a rdzenie E dokłada tylko
+  częściowo.** Założenie hipotezy, że 7.–10. wątek trafi na rdzeń E, się nie sprawdziło. Do tego
+  zegar spada z ~3,1 do ~2,65 GHz (10 wątków) i ~2,0 GHz (16 wątków), bo laptop pracuje
+  w limicie mocy. Wątek-rodzeństwo nie dokłada portów odczytu/zapisu, a obniża zegar
+  wszystkim.
+- **Jeden wątek skacze między rdzeniami.** Po przeskoku zawartość prywatnych L1/L2 przepada.
+  To może być jedno ze źródeł rozrzutu jednowątkowego z poprzednich etapów (niepotwierdzone).
+- **Hipotezy o `static` vs `dynamic` nie dało się sprawdzić.** Wymagała wątków na rdzeniach E,
+  a w WSL nie możemy przypiąć wątku do fizycznego rdzenia. Teoria zostaje (na natywnym Linuksie
+  sprawdzilibyśmy ją przez `OMP_PLACES` i `taskset`), ale tutaj wynik jest w granicach szumu.
+
+### Małe macierze: równoległość nie zawsze się opłaca
+
+| N (T=64) | 1 wątek | 6 | 10 | 16 |
+|---|---|---|---|---|
+| 256 (16 kafelków, ~1,3 ms) | 25,0 | 72,5 | 83,3 | **15,8** (CV 51%) |
+| 512 (64 kafelki, ~11 ms) | 25,0 | 82,2 | 88,4 | **38,5** (CV 48%) |
+
+Przy 16 wątkach N=256 jest **wolniejsze niż na jednym wątku**. Zadanie trwa ~0,4 ms, a każdy
+wątek ma jeden kafelek. Wystarczy, że system przerwie jeden z 16 wątków (wszystkie procesory
+logiczne są zajęte, a tło nie jest zerowe), i wszyscy czekają na niego na końcu regionu
+równoległego (*straggler*). Wniosek: nie zajmować wszystkich procesorów logicznych, zostawić
+zapas na system, a dla małych zadań używać mniej wątków.
+
+### Kontrast: saxpy w DRAM (128 MiB) prawie się nie skaluje
+
+| wątki | 1 | 2 | 4 | 6 | 8 | 10 | 16 |
+|---|---|---|---|---|---|---|---|
+| GB/s | 13,8 | 21,3 | 31,2 | 32,7 | **36,6** | 33,0 | 27,4 |
+| GFLOP/s | 2,3 | 3,6 | 5,2 | 5,4 | 6,1 | 5,5 | 4,6 |
+
+- **Hipoteza potwierdzona:** od 4 wątków przepustowość stoi na ~31–37 GB/s, czyli ~70%
+  teoretycznych 51,2 GB/s. Jeden rdzeń bierze ~14 GB/s (prawo Little'a, etap 0), a kilka rdzeni
+  nasyca kontroler pamięci.
+- Najlepszy saxpy daje 6,1 GFLOP/s, a mnożenie macierzy na tych samych rdzeniach ~118. Różnica
+  wynika z **arithmetic intensity**. saxpy potrzebuje 6 B z pamięci na każdy FLOP. Kafelkowane
+  mnożenie przy T=128 potrzebuje z L3 ok. 2/T = 1/64 B na FLOP (B i A po n³/T floatów), czyli przy
+  118 GFLOP/s zaledwie ~4 GB/s. Kod ograniczony pamięcią nie przyspieszy od dodawania
+  rdzeni, a kod o wysokim AI tak.
+- **~35 GB/s to „dach pamięci” do modelu roofline w etapie 5.**
+
+### Porównanie z hipotezą
+
+| | hipoteza | wynik | |
+|---|---|---|---|
+| 2, 4 wątki | 1,9×, 3,5× | 2,0×, 3,1–3,7× | ✓ |
+| 6 wątków | ~5×, ~120 | 118 przy dobrym rozłożeniu, 96 w przeglądzie | ✓ / szum |
+| 8–10 wątków | 140–150 | 91–113 | ✗: HT zamiast rdzeni E, zegar spada |
+| 12–16 (HT) | ±10% | −15% do −40% względem 6–10 | ✗: HT nie dokłada portów, a zjada moc |
+| static gorsze przy 10 | – | w granicach szumu | nie do sprawdzenia w WSL |
+| saxpy DRAM | nasycenie przy 2–4, 30–40 GB/s | od 4 wątków, 31–37 GB/s | ✓ |
+
+**Najlepszy wynik etapu: ~96–118 GFLOP/s przy N=1024 i 6 wątkach.** To 3,4–4,2× względem
+najlepszej wersji jednowątkowej i ~220–270× względem wersji naiwnej (0,44).
+
+### Metodologia: czego wymagałby lepszy pomiar wielowątkowy
+
+- Tryb „Najlepsza wydajność” i zamknięte programy w tle. Tło zabiera procesory, a przy pełnym
+  zajęciu każda przerwa jednego wątku zatrzymuje wszystkie.
+- Natywny Linux zamiast WSL2: przypinanie wątków do rdzeni (`OMP_PLACES=cores`,
+  `OMP_PROC_BIND=close`) i liczniki sprzętowe.
+- Liczba wątków ≤ liczba rdzeni fizycznych, z zapasem jednego procesora dla systemu.

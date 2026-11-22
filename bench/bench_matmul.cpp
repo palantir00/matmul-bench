@@ -46,13 +46,24 @@ void BM_Tiled(benchmark::State& state) {
                });
 }
 
+void BM_TiledOmp(benchmark::State& state) {
+    const int tile = static_cast<int>(state.range(1));
+    const int threads = static_cast<int>(state.range(2));
+    const auto schedule =
+        state.range(3) != 0 ? matmul::Schedule::Dynamic : matmul::Schedule::Static;
+    run_matmul(state, static_cast<int>(state.range(0)),
+               [=](const float* A, const float* B, float* C, int n) {
+                   matmul::tiled_omp(A, B, C, n, tile, threads, schedule);
+               });
+}
+
 // The same sizes for every version. 1000 is a non-power-of-two control size: at 1024 the
 // row stride is exactly 4 KiB, which causes cache set conflicts.
 constexpr int kSizes[] = {256, 512, 1000, 1024};
 
 // Rates (GFLOP/s) are computed from wall-clock time. By default Google Benchmark divides by
 // CPU time, which leaves out moments when the OS took the core away, and which with
-// several threads (stage 4) would be the sum over all threads.
+// OpenMP threads (stage 4) covers only the main thread.
 void Common(benchmark::internal::Benchmark* b) {
     b->UseRealTime();
     b->Unit(benchmark::kMillisecond);
@@ -76,8 +87,29 @@ void SizesAndTiles(benchmark::internal::Benchmark* b) {
     Common(b);
 }
 
+// Thread scaling. 6 = all P-cores, 10 = all physical cores (P + E), 16 = with HT.
+// Main case N = 1000/1024: static vs dynamic schedule with T = 128 (64 tiles), and dynamic
+// with T = 64 (256 smaller tiles). Small sizes: a few thread counts only.
+void OmpSweep(benchmark::internal::Benchmark* b) {
+    b->ArgNames({"n", "T", "threads", "dyn"});
+    for (int n : {1000, 1024}) {
+        for (int threads : {1, 2, 4, 6, 8, 10, 12, 16}) {
+            b->Args({n, 128, threads, 0});
+            b->Args({n, 128, threads, 1});
+            b->Args({n, 64, threads, 1});
+        }
+    }
+    for (int n : {256, 512}) {
+        for (int threads : {1, 6, 10, 16}) {
+            b->Args({n, 64, threads, 1});
+        }
+    }
+    Common(b);
+}
+
 BENCHMARK_CAPTURE(BM_Matmul, naive, matmul::naive)->Apply(Sizes);
 BENCHMARK_CAPTURE(BM_Matmul, ikj, matmul::ikj)->Apply(Sizes);
 BENCHMARK(BM_Tiled)->Apply(SizesAndTiles);
+BENCHMARK(BM_TiledOmp)->Apply(OmpSweep);
 
 }  // namespace

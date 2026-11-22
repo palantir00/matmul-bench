@@ -45,12 +45,16 @@ if(MATMUL_BUILD_BENCH)
 endif()
 
 # ---- Library ----------------------------------------------------------------
+find_package(OpenMP REQUIRED)
+
 add_library(matmul
   src/naive.cpp
   src/ikj.cpp
-  src/tiled.cpp)
+  src/tiled.cpp
+  src/tiled_omp.cpp)
 target_include_directories(matmul PUBLIC include)
-target_link_libraries(matmul PUBLIC matmul_flags)
+# PUBLIC: targets that link matmul (tests, benchmarks) also get -fopenmp and libgomp.
+target_link_libraries(matmul PUBLIC matmul_flags OpenMP::OpenMP_CXX)
 
 # ---- Tests ------------------------------------------------------------------
 enable_testing()

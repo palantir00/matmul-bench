@@ -40,6 +40,14 @@ const KernelCase kAllKernels[] = {
     {"tiled_t3", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 3); }},
     {"tiled_t16", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 16); }},
     {"tiled_t64", [](const float* A, const float* B, float* C, int n) { matmul::tiled(A, B, C, n, 64); }},
+    // More threads than tiles for small n, and an odd thread count that does not divide
+    // the number of tiles.
+    {"omp_t16_x4", [](const float* A, const float* B, float* C, int n) {
+         matmul::tiled_omp(A, B, C, n, 16, 4);
+     }},
+    {"omp_t3_x7_static", [](const float* A, const float* B, float* C, int n) {
+         matmul::tiled_omp(A, B, C, n, 3, 7, matmul::Schedule::Static);
+     }},
 };
 
 // Different seeds for A and B: with A == B, a kernel that computes B * A instead of A * B
@@ -281,6 +289,41 @@ TEST(Tiled, RejectsNonPositiveTile) {
     Matrix A(4), B(4), C(4);
     EXPECT_THROW(matmul::tiled(A.data(), B.data(), C.data(), 4, 0), std::invalid_argument);
     EXPECT_THROW(matmul::tiled(A.data(), B.data(), C.data(), 4, -8), std::invalid_argument);
+}
+
+// ---- OpenMP-specific -----------------------------------------------------------
+
+// Each C tile is computed by one thread in the same order as ikj, so the thread count and
+// the schedule must not change a single bit. A race (two threads writing one tile) or a
+// skipped tile would show up here as mismatches.
+TEST(TiledOmp, BitIdenticalToIkjForAnyThreadCount) {
+    const int n = 129;  // 129 = 2 * 64 + 1: a one-element-wide edge tile
+    Matrix A(n), B(n), R(n), C(n);
+    A.fill_random(kSeedA);
+    B.fill_random(kSeedB);
+    matmul::ikj(A.data(), B.data(), R.data(), n);
+
+    for (auto schedule : {matmul::Schedule::Static, matmul::Schedule::Dynamic}) {
+        for (int tile : {16, 64}) {
+            for (int threads : {1, 2, 3, 7, 16}) {
+                C.fill(std::numeric_limits<float>::quiet_NaN());
+                matmul::tiled_omp(A.data(), B.data(), C.data(), n, tile, threads, schedule);
+                std::size_t mismatches = 0;
+                for (std::size_t idx = 0; idx < C.size(); ++idx) {
+                    mismatches += (C.data()[idx] != R.data()[idx]) ? 1 : 0;
+                }
+                EXPECT_EQ(mismatches, 0u)
+                    << "tile=" << tile << " threads=" << threads << " static="
+                    << (schedule == matmul::Schedule::Static);
+            }
+        }
+    }
+}
+
+TEST(TiledOmp, RejectsBadArguments) {
+    Matrix A(4), B(4), C(4);
+    EXPECT_THROW(matmul::tiled_omp(A.data(), B.data(), C.data(), 4, 0, 2), std::invalid_argument);
+    EXPECT_THROW(matmul::tiled_omp(A.data(), B.data(), C.data(), 4, 2, 0), std::invalid_argument);
 }
 
 // ---- The check itself ---------------------------------------------------------
