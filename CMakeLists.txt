@@ -51,7 +51,8 @@ add_library(matmul
   src/naive.cpp
   src/ikj.cpp
   src/tiled.cpp
-  src/tiled_omp.cpp)
+  src/tiled_omp.cpp
+  src/linear_relu.cpp)
 target_include_directories(matmul PUBLIC include)
 # PUBLIC: targets that link matmul (tests, benchmarks) also get -fopenmp and libgomp.
 target_link_libraries(matmul PUBLIC matmul_flags OpenMP::OpenMP_CXX)
@@ -70,7 +71,9 @@ gtest_discover_tests(matmul_tests)
 if(MATMUL_BUILD_BENCH)
   add_executable(matmul_bench
     bench/bench_bandwidth.cpp
-    bench/bench_matmul.cpp)
+    bench/bench_matmul.cpp
+    bench/bench_fusion.cpp
+    bench/bench_peak.cpp)
   target_link_libraries(matmul_bench PRIVATE matmul benchmark::benchmark_main)
 endif()
 

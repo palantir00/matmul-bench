@@ -6,10 +6,12 @@
 #include <iterator>
 #include <limits>
 #include <ostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "matmul/matmul.hpp"
@@ -324,6 +326,170 @@ TEST(TiledOmp, RejectsBadArguments) {
     Matrix A(4), B(4), C(4);
     EXPECT_THROW(matmul::tiled_omp(A.data(), B.data(), C.data(), 4, 0, 2), std::invalid_argument);
     EXPECT_THROW(matmul::tiled_omp(A.data(), B.data(), C.data(), 4, 2, 0), std::invalid_argument);
+}
+
+// ---- Linear layer with ReLU (stage 5) -------------------------------------------
+
+constexpr unsigned kSeedBias = 44;
+
+std::vector<float> random_bias(int n) {
+    std::mt19937 gen(kSeedBias);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> bias(n);
+    for (float& b : bias) {
+        b = dist(gen);
+    }
+    return bias;
+}
+
+// Reference for relu(A * B + bias) in double. Adding the bias is one more rounded addition,
+// like an (n+1)-th term of the dot product: the scale gets |bias_j| and the bound for n + 1
+// terms applies. ReLU never increases a difference (|relu(x) - relu(y)| <= |x - y|), so it
+// needs no extra margin.
+Expected exact_linear_relu(const Matrix& A, const Matrix& B, const std::vector<float>& bias) {
+    Expected e = exact_product(A, B);
+    const int n = A.n();
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            const std::size_t idx = static_cast<std::size_t>(i) * n + j;
+            e.value[idx] = std::max(e.value[idx] + static_cast<double>(bias[j]), 0.0);
+            e.scale[idx] += std::abs(static_cast<double>(bias[j]));
+        }
+    }
+    return e;
+}
+
+using LinearKernel = void (*)(const float*, const float*, const float*, float*, int, int, int);
+
+struct LinearCase {
+    const char* name;
+    LinearKernel fn;
+};
+
+const LinearCase kLinearKernels[] = {
+    {"unfused", matmul::linear_relu_unfused},
+    {"fused", matmul::linear_relu_fused},
+};
+
+// (tile, threads): edge tiles and more threads than tiles, as for tiled_omp above.
+const std::pair<int, int> kTileThreads[] = {{3, 7}, {16, 4}, {64, 1}};
+
+std::size_t count_mismatches(const Matrix& X, const Matrix& Y) {
+    std::size_t mismatches = 0;
+    for (std::size_t idx = 0; idx < X.size(); ++idx) {
+        mismatches += (X.data()[idx] != Y.data()[idx]) ? 1 : 0;
+    }
+    return mismatches;
+}
+
+TEST(LinearRelu, WithinBoundOfExactAndNaive) {
+    for (int n : kSizes) {
+        Matrix A(n), B(n), C(n), R(n);
+        A.fill_random(kSeedA);
+        B.fill_random(kSeedB);
+        const std::vector<float> bias = random_bias(n);
+        const Expected exact = exact_linear_relu(A, B, bias);
+
+        // Naive reference: the textbook matmul, then bias and ReLU written out here.
+        matmul::naive(A.data(), B.data(), R.data(), n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                R(i, j) = std::max(R(i, j) + bias[j], 0.0f);
+            }
+        }
+        const Expected ref = as_reference(R, exact);
+
+        for (const LinearCase& k : kLinearKernels) {
+            for (const auto& [tile, threads] : kTileThreads) {
+                C.fill(std::numeric_limits<float>::quiet_NaN());
+                k.fn(A.data(), B.data(), bias.data(), C.data(), n, tile, threads);
+                EXPECT_TRUE(close_to(C, exact, tolerance(n + 1)))
+                    << k.name << " n=" << n << " tile=" << tile << " threads=" << threads;
+                EXPECT_TRUE(close_to(C, ref, 2 * tolerance(n + 1)))
+                    << k.name << " vs naive, n=" << n << " tile=" << tile;
+            }
+        }
+    }
+}
+
+// Fused and unfused do the same float operations on every element in the same order:
+// the dot product as in ikj, then + bias[j], then ReLU. Only the moment of the epilogue
+// differs, so the results must agree bit for bit for any tile size and thread count.
+TEST(LinearRelu, FusedBitIdenticalToUnfused) {
+    for (int n : {127, 256}) {
+        Matrix A(n), B(n), R(n), C(n);
+        A.fill_random(kSeedA);
+        B.fill_random(kSeedB);
+        const std::vector<float> bias = random_bias(n);
+        for (int tile : {1, 16, 64, 100}) {
+            for (int threads : {1, 3, 16}) {
+                R.fill(std::numeric_limits<float>::quiet_NaN());
+                C.fill(std::numeric_limits<float>::quiet_NaN());
+                matmul::linear_relu_unfused(A.data(), B.data(), bias.data(), R.data(), n, tile,
+                                            threads);
+                matmul::linear_relu_fused(A.data(), B.data(), bias.data(), C.data(), n, tile,
+                                          threads);
+                EXPECT_EQ(count_mismatches(C, R), 0u)
+                    << "n=" << n << " tile=" << tile << " threads=" << threads;
+            }
+        }
+    }
+}
+
+TEST(LinearRelu, BiasGoesToColumnsAndReluClamps) {
+    // I * B = B, then bias per column: [1 2; 3 4] + [10 -3] = [11 -1; 13 1] -> ReLU.
+    // A bias added per row instead would give [11 12; 0 1].
+    Matrix I(2), B(2), C(2);
+    const float b[] = {1, 2, 3, 4};
+    std::copy(b, b + 4, B.data());
+    I.fill(0.0f);
+    I(0, 0) = I(1, 1) = 1.0f;
+    const float bias[] = {10.0f, -3.0f};
+
+    for (const LinearCase& k : kLinearKernels) {
+        k.fn(I.data(), B.data(), bias, C.data(), 2, 1, 2);
+        EXPECT_EQ(C(0, 0), 11.0f) << k.name;
+        EXPECT_EQ(C(0, 1), 0.0f) << k.name;
+        EXPECT_EQ(C(1, 0), 13.0f) << k.name;
+        EXPECT_EQ(C(1, 1), 1.0f) << k.name;
+    }
+}
+
+TEST(LinearRelu, RejectsBadArguments) {
+    Matrix A(4), B(4), C(4);
+    const float bias[4] = {};
+    for (const LinearCase& k : kLinearKernels) {
+        EXPECT_THROW(k.fn(A.data(), B.data(), bias, C.data(), 4, 0, 2), std::invalid_argument);
+        EXPECT_THROW(k.fn(A.data(), B.data(), bias, C.data(), 4, 2, 0), std::invalid_argument);
+    }
+    EXPECT_THROW(matmul::add_bias(C.data(), bias, 4, 0), std::invalid_argument);
+    EXPECT_THROW(matmul::relu(C.data(), 4, 0), std::invalid_argument);
+    EXPECT_THROW(matmul::add_bias_relu(C.data(), bias, 4, 0), std::invalid_argument);
+}
+
+TEST(Elementwise, TwoPassesEqualOnePass) {
+    const int n = 37;
+    Matrix X(n), Y(n);
+    X.fill_random(kSeedA);
+    std::copy(X.data(), X.data() + X.size(), Y.data());
+    const std::vector<float> bias = random_bias(n);
+    for (int threads : {1, 5}) {
+        matmul::add_bias(X.data(), bias.data(), n, threads);
+        matmul::relu(X.data(), n, threads);
+        matmul::add_bias_relu(Y.data(), bias.data(), n, threads);
+        EXPECT_EQ(count_mismatches(X, Y), 0u) << "threads=" << threads;
+    }
+}
+
+TEST(Elementwise, ReluClampsNegativesAndKeepsNaN) {
+    Matrix C(2);
+    const float c[] = {-2.0f, 0.0f, 3.0f, std::numeric_limits<float>::quiet_NaN()};
+    std::copy(c, c + 4, C.data());
+    matmul::relu(C.data(), 2, 1);
+    EXPECT_EQ(C(0, 0), 0.0f);
+    EXPECT_EQ(C(0, 1), 0.0f);
+    EXPECT_EQ(C(1, 0), 3.0f);
+    EXPECT_TRUE(std::isnan(C(1, 1))) << "ReLU must not turn NaN into 0";
 }
 
 // ---- The check itself ---------------------------------------------------------

@@ -33,4 +33,26 @@ enum class Schedule {
 void tiled_omp(const float* A, const float* B, float* C, int n, int tile, int threads,
                Schedule schedule = Schedule::Dynamic);
 
+// Version 5: linear layer with ReLU, C = relu(A * B + bias), like nn.Linear + ReLU with
+// A = inputs and B = weights. bias has n elements; bias[j] is added to every element of
+// column j. The matmul part is the tiled OpenMP kernel (dynamic schedule).
+//
+// Unfused: matmul, then a bias pass and a ReLU pass over C (three passes over C, like
+// three separate kernels in an eager framework).
+// Fused: bias and ReLU are applied to each C tile right after its last k block, while
+// the tile is still in cache (one pass over C).
+// Both do the same operations on every element in the same order, so their results are
+// identical bit for bit. Throw std::invalid_argument if tile < 1 or threads < 1.
+void linear_relu_unfused(const float* A, const float* B, const float* bias, float* C, int n,
+                         int tile, int threads);
+void linear_relu_fused(const float* A, const float* B, const float* bias, float* C, int n,
+                       int tile, int threads);
+
+// Elementwise passes over an n x n matrix, in place, rows split over threads.
+// ReLU keeps NaN as NaN, so an error upstream is not hidden as 0.
+// Throw std::invalid_argument if threads < 1.
+void add_bias(float* C, const float* bias, int n, int threads);       // C(i, j) += bias[j]
+void relu(float* C, int n, int threads);                              // C = max(C, 0)
+void add_bias_relu(float* C, const float* bias, int n, int threads);  // both in one pass
+
 }  // namespace matmul

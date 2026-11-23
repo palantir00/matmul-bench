@@ -894,9 +894,11 @@ zapas na system, a dla małych zadań używać mniej wątków.
   nasyca kontroler pamięci.
 - Najlepszy saxpy daje 6,1 GFLOP/s, a mnożenie macierzy na tych samych rdzeniach ~118. Różnica
   wynika z **arithmetic intensity**. saxpy potrzebuje 6 B z pamięci na każdy FLOP. Kafelkowane
-  mnożenie przy T=128 potrzebuje z L3 ok. 2/T = 1/64 B na FLOP (B i A po n³/T floatów), czyli przy
-  118 GFLOP/s zaledwie ~4 GB/s. Kod ograniczony pamięcią nie przyspieszy od dodawania
-  rdzeni, a kod o wysokim AI tak.
+  mnożenie przy T=128 potrzebuje z L3 ok. 4/T = 1/32 B na FLOP (A i B po n³/T floatów po 4 B,
+  na 2n³ FLOP), czyli przy 118 GFLOP/s zaledwie ~4 GB/s. Kod ograniczony pamięcią nie
+  przyspieszy od dodawania rdzeni, a kod o wysokim AI tak.
+  *(Poprawka z etapu 5: wcześniej było tu „2/T = 1/64”, co nie zgadzało się z liczbą floatów
+  w nawiasie. Wynik ~4 GB/s był policzony dobrze.)*
 - **~35 GB/s to „dach pamięci” do modelu roofline w etapie 5.**
 
 ### Porównanie z hipotezą
@@ -920,3 +922,272 @@ najlepszej wersji jednowątkowej i ~220–270× względem wersji naiwnej (0,44).
 - Natywny Linux zamiast WSL2: przypinanie wątków do rdzeni (`OMP_PLACES=cores`,
   `OMP_PROC_BIND=close`) i liczniki sprzętowe.
 - Liczba wątków ≤ liczba rdzeni fizycznych, z zapasem jednego procesora dla systemu.
+
+---
+
+## Etap 5: fuzja operacji i model roofline
+
+### Problem: warstwa liniowa z ReLU
+
+Liczymy `Y = relu(A·B + bias)`, czyli przejście w przód warstwy `nn.Linear` z ReLU (A to wejścia,
+B to wagi). `bias` ma N elementów, a `bias[j]` dodajemy do całej kolumny j.
+
+```
+bez fuzji: 3 przejścia po C                     z fuzją: 1 przejście
+A,B ─matmul─► C ─(+bias)─► C ─relu─► C           A,B ─matmul + bias + relu na kafelku─► C
+            zapis   odczyt+zapis  odczyt+zapis                     zapis
+```
+
+Bez fuzji każda operacja to osobne przejście po całej macierzy, tak jak trzy osobne kernele
+we frameworku w trybie eager. Z fuzją bias i ReLU trafiają na kafelek C zaraz po jego ostatnim
+bloku k, gdy kafelek (128×128 floatów = 64 KiB) wciąż jest w L2 rdzenia.
+
+### Kod
+
+```cpp
+void compute_c_tile(A, B, bias, C, n, tile, ii, jj) {
+    ...                                    // kafelek liczony dokładnie jak w tiled_omp
+    if (bias != nullptr)                   // wariant z fuzją
+        for (i w kafelku) for (j w kafelku)
+            Ci[j] = relu1(Ci[j] + bias[j]);
+}
+// bez fuzji: matmul_tiles(A, B, nullptr, C, ...); add_bias(C, ...); relu(C, ...);
+// z fuzją:   matmul_tiles(A, B, bias, C, ...);
+```
+
+- **Oba warianty są identyczne bit w bit.** Na każdym elemencie wykonują te same działania
+  w tej samej kolejności: iloczyn skalarny jak w i-k-j, potem `+ bias[j]`, potem ReLU. Różni się
+  tylko moment wykonania epilogu. Sprawdza to test `LinearRelu.FusedBitIdenticalToUnfused`
+  dla różnych kafli i liczby wątków.
+- **Bias dodajemy na końcu, a nie jako wartość początkową C.** Wariant BLAS-owy (C zainicjowane
+  biasem, potem akumulacja) byłby darmowy, bo C i tak trzeba wyzerować. Zmieniłby jednak
+  zaokrąglenia (bias pierwszy zamiast ostatniego), więc stracilibyśmy dokładne porównanie
+  z wersją bez fuzji.
+- **Tolerancja.** Dodanie biasu to jedno dodawanie więcej, jak (N+1)-szy składnik iloczynu
+  skalarnego. Skala błędu to więc Σ|a·b| + |bias|, a granica jak dla N+1 składników. ReLU nie
+  powiększa różnic (|relu(x) − relu(y)| ≤ |x − y|), więc nie potrzebuje zapasu.
+- **ReLU przepuszcza NaN.** `x < 0 ? 0 : x` zamiast `x > 0 ? x : 0`: porównanie z NaN jest
+  fałszywe, więc NaN przechodzi dalej i nie zamienia się w 0. Błąd wcześniej w obliczeniach
+  (np. niewyzerowane C) nie zostanie ukryty.
+
+### Ruch danych i arithmetic intensity (model)
+
+| operacja | FLOP na element | bajty na element | AI [FLOP/B] |
+|---|---|---|---|
+| `+ bias` (osobne przejście) | 1 | 8 (odczyt i zapis C) | 0,125 |
+| `relu` (osobne przejście) | 1 (porównanie) | 8 | 0,125 |
+| `+ bias` i `relu` w jednym przejściu | 2 | 8 | **0,25** |
+| matmul N=1024 (każda macierz raz) | 2N³ / N² | 3·4·N² / N² | N/6 ≈ **170** |
+
+Fuzja dwóch przejść w jedno podwaja AI, bo bajtów jest o połowę mniej przy tej samej liczbie
+działań. Ile to daje całej warstwie? Dwa dodatkowe przejścia to 16·N² B, a matmul to 2N³ FLOP:
+
+```
+koszt 2 przejść / koszt matmul = (16·N² / BW) / (2·N³ / F) = 8·F / (N·BW)
+```
+
+Dla prostokątnego mnożenia (M×K)·(K×N) wychodzi to samo z K zamiast N: **8·F / (K·BW)**.
+Zysk z fuzji epilogu zależy tylko od wymiaru, po którym sumujemy (K), i od stosunku szybkości
+liczenia F do przepustowości pamięci BW.
+
+### Hipoteza przed pomiarem
+
+1. Warstwa N=256–1024 z fuzją i bez: zysk ~0,3–1% (z wzoru: N=1024, F≈25 GFLOP/s,
+   BW(L3)≈45 GB/s daje 0,4%). To poniżej szumu, więc spodziewamy się „braku mierzalnej różnicy”.
+2. Sam epilog: jedno przejście zamiast dwóch daje ~2× w DRAM (N=4096, 64 MiB), bo przy AI = 0,125
+   liczą się wyłącznie bajty.
+3. Dach obliczeniowy: 1 wątek ≈ 32 FLOP/cykl × ~3 GHz ≈ 90–100 GFLOP/s, 6 wątków ≈ 500–600
+   (zegar spada pod limitem mocy). Nasz matmul (~100–118 przy 6 wątkach) leży daleko na prawo od
+   punktu przegięcia i ~20% pod dachem obliczeniowym. Ogranicza go własna pętla, a nie pamięć.
+
+### Pierwsze podejście: 3–8% różnicy, która nie była fuzją
+
+Pierwsza wersja miała `compute_c_tile` jako szablon `template <bool kFused>`, czyli dwie
+skompilowane kopie tej samej pętli. Pomiar (10 powtórzeń, przeplatanie, CV 2–5%):
+
+| N (kafel) | wątki | bez fuzji [ms] | z fuzją [ms] | różnica |
+|---|---|---|---|---|
+| 256 (64) | 1 | 1,283 | 1,381 | **+7,6%** (fuzja wolniejsza) |
+| 256 (64) | 6 | 0,330 | 0,347 | +5,2% |
+| 512 (64) | 1 | 10,72 | 11,41 | **+6,4%** |
+| 512 (64) | 6 | 2,484 | 2,560 | +3,1% |
+| 1000 (128) | 1 | 77,08 | 76,04 | −1,3% |
+| 1000 (128) | 6 | 16,40 | 16,28 | −0,7% |
+| 1024 (128) | 1 | 86,62 | 85,23 | −1,6% |
+| 1024 (128) | 6 | 17,94 | 17,24 | −3,9% |
+
+Przy T=64 fuzja była systematycznie **wolniejsza** o 3–8%, choć sam epilog kosztuje ~5 µs, a różnica
+wynosiła ~100 µs. Pętle wewnętrzne obu kopii w asemblerze są identyczne instrukcja w instrukcję
+i w gotowym programie mieszczą się w jednym 32-bajtowym oknie. Różni się kod pętli zewnętrznych
+`i`/`k` (inne zmienne zrzucane na stos). Przy T=64 pętla wewnętrzna ma tylko 8 obrotów, więc
+narzut uruchomienia (model z etapu 3: ~5 cykli) waży tyle co ona sama. Bez liczników sprzętowych
+nie ustalimy, co dokładnie kosztuje.
+
+**Poprawka:** jedna funkcja zamiast szablonu, a wariant wybiera wskaźnik `bias` sprawdzany raz
+na kafelek. Obie wersje wykonują teraz **ten sam kod maszynowy** mnożenia (`objdump`: jedna kopia
+pętli z `vfmadd213ps`). Ten sam mechanizm może stać za niewyjaśnioną różnicą ~10% między
+`tiled` a `tiled_omp` na 1 wątku z etapu 4 (niepotwierdzone).
+
+**Lekcja:** żeby zmierzyć efekt rzędu 1%, oba warianty muszą dzielić całą resztę kodu, łącznie
+z kodem maszynowym. Dwie kopie „tego samego” kodu potrafią różnić się o kilka procent.
+
+### Wyniki: cała warstwa (wspólny kod, 15 powtórzeń, przeplatanie)
+
+Warunki: tryb „Zrównoważony”, `clock_probe` przed i po: ~2,8–3,0 GHz.
+
+| N (kafel) | wątki | bez fuzji [ms] (CV) | z fuzją [ms] (CV) | różnica | górna granica zysku* |
+|---|---|---|---|---|---|
+| 256 (64) | 1 | 1,282 (1,9%) | 1,281 (1,9%) | −0,1% | 0,9% |
+| 256 (64) | 6 | 0,338 (12%) | 0,330 (9%) | −2,4% | 1,7% |
+| 512 (64) | 1 | 10,52 (2,0%) | 10,64 (2,6%) | +1,1% | – |
+| 512 (64) | 6 | 2,468 (12%) | 2,443 (3,2%) | −1,0% | – |
+| 1000 (128) | 1 | 80,67 (2,0%) | 80,33 (3,0%) | −0,4% | – |
+| 1000 (128) | 6 | 16,65 (13%) | 16,19 (3,7%) | −2,8% | – |
+| 1024 (128) | 1 | 88,10 (3,0%) | 88,94 (2,7%) | +1,0% | 0,33% |
+| 1024 (128) | 6 | 17,84 (4,7%) | 18,36 (17%) | +2,9% | 0,38% |
+
+\* czas dwóch osobnych przejść epilogu (zmierzony niżej) / czas całej warstwy. Fuzja nie może
+dać więcej, bo epilog z fuzją też coś kosztuje.
+
+- **Hipoteza 1 potwierdzona:** różnice ±3% w obie strony, czyli szum. Przy CV 2–3% i 15
+  powtórzeniach rozdzielczość mediany to ok. ±1,5%. Efektu 0,3–0,4% nie da się tak zmierzyć.
+- Koszt epilogu wynika wprost ze wzoru: 8·24,4/(1024·57) = 0,33% przy 1 wątku i
+  8·120/(1024·246) = 0,38% przy 6 wątkach. Epilog to O(N²) przy O(N³) mnożenia.
+
+### Wyniki: sam epilog (10 powtórzeń)
+
+| N (gdzie leży C) | wątki | 2 przejścia | 1 przejście | zysk | GB/s: 2 przejścia / 1 |
+|---|---|---|---|---|---|
+| 256 (L2, 256 KiB) | 1 | 11,2 µs | 6,7 µs | 1,68× | 93 / 78 |
+| 256 | 6 | 5,6 µs | 3,3 µs | 1,69× | 187 / 158 (CV ~10%) |
+| 1024 (L3, 4 MiB) | 1 | 295 µs | 146 µs | **2,01×** | 57 / 57 |
+| 1024 | 6 | 68 µs | 36 µs | 1,91× | 246 / 235 (CV 13–15%) |
+| 4096 (DRAM, 64 MiB) | 1 | 20,4 ms | 7,7 ms | 2,66× | 13,1 / 17,5 (CV 12–13%) |
+| 4096 | 6 | 7,8 ms | 3,8 ms | **2,04×** | 34,5 / 35,2 |
+
+- **Hipoteza 2 potwierdzona:** w L3 i w DRAM przy 6 wątkach zysk to ~2×, a przepustowość obu
+  wariantów jest taka sama. Kod ograniczony pamięcią przyspiesza dokładnie o tyle, o ile mniej
+  bajtów przesyła. Dokładnie tak działa fuzja operacji elementwise w kompilatorach ML
+  (`torch.compile`, XLA).
+- **W L2 tylko 1,7×.** Przy tak szybkiej pamięci zaczyna liczyć się liczba instrukcji na element.
+  Na 8 floatów połączone przejście robi 3 operacje pamięciowe (odczyt C, odczyt biasu, zapis C),
+  a dwa osobne razem 5 (3 + 2). Stosunek 5/3 ≈ 1,67 zgadza się z pomiarem, ale bez liczników
+  to tylko hipoteza.
+- **DRAM na 1 wątku: 2,66×**, czyli więcej niż wynika z bajtów: osobne przejścia dostają niższą
+  przepustowość (13 wobec 17,5 GB/s). Osobny pomiar każdego przejścia (`add_bias` i `relu`
+  osobno, po ~9–11 ms) potwierdza, że oba są wolniejsze od połączonego, ale rozrzut jednowątkowego
+  DRAM to ±20% (pamięć dzieli cały system). **Pytanie otwarte.**
+
+### Dachy: zmierzony szczyt obliczeniowy i przepustowość
+
+Nowy benchmark `BM_PeakFma`: każdy wątek liczy 12 niezależnych łańcuchów FMA 256-bit (dwie
+jednostki FMA × opóźnienie 4 cykle = co najmniej 8 łańcuchów w locie).
+
+| wątki | 1 | 6 | 10 | 16 |
+|---|---|---|---|---|
+| GFLOP/s | **94,2** (CV 0,9%) | **468** (7%) | 580 (2%) | 503 (19%) |
+
+- 1 wątek: 94,2 = 32 FLOP/cykl × 2,94 GHz, czyli 99% teorii przy zegarze z `clock_probe`.
+- 6 wątków: 468 / (6 × 32) ≈ 2,4 GHz, jeśli wszystkie wątki są na rdzeniach P. Kod złożony
+  z samych FMA pobiera więcej mocy niż nasz matmul (przy nim liczniki Windows pokazywały ~3,1 GHz),
+  więc limit mocy obniża zegar bardziej.
+- 10 wątków: + 4 rdzenie E (16 FLOP/cykl). 16 wątków: HT nie dokłada jednostek FMA.
+- **Static kontra dynamic, tym razem wyraźnie.** Pierwsza wersja dawała każdemu wątkowi równą,
+  stałą porcję pracy: **299 GFLOP/s** przy 6 wątkach. Czas iteracji wyznaczał najwolniejszy wątek
+  (rdzeń E albo rodzeństwo HT liczy 2× wolniej). Po podziale na małe porcje rozdawane
+  dynamicznie wynik to **~490**. W etapie 4 na mnożeniu macierzy ten efekt ginął w szumie, a tu,
+  przy czystych obliczeniach, różnica wynosi 1,6×.
+
+Przepustowość (saxpy, ten sam przebieg): 1 wątek L1 234 GB/s, L2 128, L3 51, DRAM 11,4 (CV 14%);
+**6 wątków DRAM 33,0 GB/s**. Dla L3 przy 6 wątkach nie ma osobnego pomiaru. Przyjmujemy ~240 GB/s
+zmierzone przez sam epilog, więc punkty C i D poniżej leżą na tym dachu z definicji.
+
+### Model roofline
+
+```
+osiągalne GFLOP/s = min( szczyt obliczeniowy,  AI × przepustowość pamięci )
+punkt przegięcia (ridge point) = szczyt / przepustowość   [FLOP/B]
+```
+
+Kod o AI na lewo od punktu przegięcia jest ograniczony pamięcią, a na prawo obliczeniami.
+6 wątków: 468 / 33 = **14 FLOP/B** dla DRAM (1,9 dla L3); 1 wątek: 94 / 11,4 = 8 FLOP/B.
+
+```
+GFLOP/s (log), 6 wątków
+1000 |
+     |
+     |               .---------------------------------   szczyt FMA: 468
+     |             ..        //
+     |           ..        //
+     |         ..        //
+ 100 |       ..        //                    M
+     |     D.        //
+     |   ..        //
+     | C.        //
+     |.        //
+     |       //
+  10 |     B/
+     |   //
+     | A/
+     |/
+     |
+     |
+   1 |
+     +-------------------------------------------------
+      0.1         1           10          100         1000   AI [FLOP/B] (log)
+
+  ////  dach DRAM, 33 GB/s          ....  dach L3, ~240 GB/s
+  A, B  epilog w DRAM (N=4096): 2 przejścia / 1 przejście
+  C, D  epilog w L3 (N=1024):   2 przejścia / 1 przejście
+  M     warstwa N=1024: 120 GFLOP/s przy AI ≈ 170
+```
+
+| punkt | AI | zmierzone GFLOP/s | dach | % dachu |
+|---|---|---|---|---|
+| A: 2 przejścia, DRAM | 0,125 | 4,3 | 0,125 × 33 = 4,1 | ~100% |
+| B: 1 przejście, DRAM | 0,25 | 8,8 | 0,25 × 33 = 8,3 | ~100% |
+| M: warstwa N=1024, 6 wątków | ~170 | 120 | 468 | **26%** |
+| warstwa N=1024, 1 wątek | ~170 | 24,4 | 94 | **26%** |
+
+Wnioski:
+- **Epilog leży na dachu pamięci.** Szybciej się nie da, można tylko przesyłać mniej bajtów,
+  czyli przesunąć punkt w prawo przez fuzję (A → B, C → D).
+- **Matmul leży daleko na prawo od punktu przegięcia, a mimo to 74% pod dachem.** Ogranicza go
+  nie pamięć, tylko własna pętla: na każdą FMA przypadają 2 odczyty i 1 zapis C, plus narzut
+  krótkiej pętli. Ten sam ułamek (26%) na 1 i na 6 wątkach potwierdza, że to limit wewnątrz
+  rdzenia. Model roofline z samymi dachami tego nie pokaże, trzeba dorysować „sufit” danej
+  pętli. Do dachu prowadzi blokowanie rejestrowe (kafelek C w rejestrach), jak w BLAS (etap 6).
+
+### Kiedy fuzja epilogu się opłaca
+
+Ze wzoru 8·F/(K·BW), koszt dwóch osobnych przejść względem mnożenia:
+
+| scenariusz | F [GFLOP/s] | BW [GB/s] | K | koszt epilogu bez fuzji |
+|---|---|---|---|---|
+| nasz kernel, 1 wątek, N=1024 (C w L3) | 24 | 57 | 1024 | 0,33% (zmierzone) |
+| nasz kernel, 6 wątków, N=1024 | 120 | 246 | 1024 | 0,38% (zmierzone) |
+| kernel klasy BLAS, duży batch (C w DRAM) | ~450 | 33 | 1024 | ~11% |
+| to samo, wąska warstwa | ~450 | 33 | 64 | ~170% |
+| akcelerator, F/BW rzędu 100–300 FLOP/B | – | – | 1024 | ~80–230% |
+
+- **Im szybszy matmul, tym więcej waży epilog bez fuzji.** To znowu prawo Amdahla: przyspieszamy
+  część O(N³), a część ograniczona pamięcią zostaje. U nas fuzja epilogu nic nie daje, bo nasz
+  kernel jest wolny.
+- **Akceleratory (GPU, Tenstorrent) mają stosunek F/BW o rząd wielkości wyższy niż nasz CPU.**
+  Tam przejście przez DRAM między operacjami kosztuje tyle co samo mnożenie, dlatego fuzja
+  (i trzymanie danych w pamięci na chipie między operacjami) to podstawa. Wrócimy do tego
+  w etapie 6.
+- W PyTorch `nn.Linear` dla wejścia 2D woła `addmm`, czyli BLAS z C zainicjowanym biasem, więc
+  bias jest już „wliczony” w wywołanie BLAS. ReLU w trybie eager to osobny kernel. Sprawdzimy
+  to w etapie 6.
+
+### Porównanie z hipotezą
+
+| | hipoteza | wynik | |
+|---|---|---|---|
+| warstwa z fuzją i bez | zysk 0,3–1%, niemierzalny | ±3% w obie strony (szum); z pomiaru epilogu 0,3–0,4% | ✓ |
+| epilog: 1 przejście zamiast 2 | ~2× w DRAM | 2,0× (6 wątków), 2,7× (1 wątek, CV 12%) | ✓ (1 wątek: pytanie otwarte) |
+| epilog w L2 | – | 1,7×: liczy się liczba instrukcji | nowa obserwacja |
+| szczyt 1 / 6 wątków | 90–100 / 500–600 | 94 / 468 (~2,4 GHz pod limitem mocy) | ✓ / trochę niżej |
+| matmul w roofline | ~20% dachu, ograniczenie w pętli | 26% przy 1 i 6 wątkach | ✓ |
+| (nieplanowane) | – | dwie kopie tej samej pętli: 3–8% różnicy | lekcja metodologiczna |
