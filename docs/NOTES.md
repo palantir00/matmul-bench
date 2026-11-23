@@ -1191,3 +1191,131 @@ Ze wzoru 8·F/(K·BW), koszt dwóch osobnych przejść względem mnożenia:
 | szczyt 1 / 6 wątków | 90–100 / 500–600 | 94 / 468 (~2,4 GHz pod limitem mocy) | ✓ / trochę niżej |
 | matmul w roofline | ~20% dachu, ograniczenie w pętli | 26% przy 1 i 6 wątkach | ✓ |
 | (nieplanowane) | – | dwie kopie tej samej pętli: 3–8% różnicy | lekcja metodologiczna |
+
+---
+
+## Etap 6: porównanie z PyTorch (MKL), wyniki końcowe, co dodaje BLAS
+
+### Co doszło
+
+- `scripts/bench_torch.py`: `torch.matmul(A, B, out=C)` oraz `relu_(addmm(bias, A, B, out=C))`
+  dla tych samych rozmiarów, metodą jak w C++: stałe ziarno, rozgrzewka, każde powtórzenie trwa
+  ≥ 0,5 s, powtórzenia wszystkich konfiguracji w losowej kolejności (przeplatanie), mediana i CV.
+  Skrypt zapisuje też wersję PyTorch, bibliotekę BLAS, błąd względem wyniku dokładnego i listę
+  operatorów, które naprawdę wykonuje `F.linear` + ReLU.
+- `scripts/run_final.sh`: cała seria końcowa jednym poleceniem (`clock_probe` przed i po,
+  wszystkie benchmarki C++, PyTorch). Wyniki: `results/final_cpp.json`, `final_torch.json`,
+  `final_clock.txt`.
+- `scripts/plot_results.py`: wykresy do `docs/img/` i tabele do README, wszystko liczone z JSON.
+- Środowisko: PyTorch 2.15.0 (CPU), MKL 2024.2, ścieżka AVX2; venv w `~/.venvs/matmul-bench`
+  na dysku WSL (instalacja na `/mnt/c` byłaby wielokrotnie wolniejsza).
+
+**Uwaga o procesie:** w tym etapie hipoteza ilościowa nie została spisana przed pomiarem.
+Jakościowo z etapu 5 wynikało tylko, że BLAS powinien dojść blisko dachu obliczeniowego
+(blokowanie rejestrowe). Krótki test skryptu (86 GFLOP/s na 1 wątku) poprzedzał pełny pomiar.
+
+### Warunki serii końcowej
+
+Tryb „Zrównoważony”, zasilacz z ładowaniem baterii (54%), 5 powtórzeń. `clock_probe` przed:
+2,56–2,79 GHz, po: 2,77–2,88 GHz, czyli zegar niższy niż w poprzednich etapach (2,8–3,0).
+Seria jest wyraźnie bardziej zaszumiona (CV do 29% przy wielu wątkach). Wnioski z niej opieramy
+na tym, co powtarza się z pomiarami z etapów, a nie na pojedynczych liczbach.
+
+### Wyniki (GFLOP/s, mediana)
+
+| wersja | wątki | N=256 | N=512 | N=1000 | N=1024 | % szczytu FMA (1024) |
+|---|---|---|---|---|---|---|
+| naiwna | 1 | 2,56 | 2,01 | 2,58 | 0,45 | 0,5% |
+| i-k-j | 1 | 24,9 | 26,2 | 19,6 | 20,1 | 22% |
+| kafelki T=128 | 1 | 32,9 | 30,0 | 27,4 | 25,3 | 28% |
+| kafelki + OpenMP | 6 | 73,6 | 85,1 | 92,5 | 96,4 | 20% |
+| PyTorch (MKL) | 1 | 83,4 | 83,4 | 82,3 | 81,1 | **89%** |
+| PyTorch (MKL) | 6 | 217 | 281 | 319 | 307 | 65% |
+
+Szczyt FMA w tej serii: 91,3 (1 wątek), 470 (6), 576 (10), 410 (16) GFLOP/s.
+
+- **MKL jest 3,2× szybszy od naszego kodu, zarówno na 1, jak i na 6 wątkach.** Różnicy nie robią
+  wątki, tylko budowa pętli.
+- **Dokładność MKL:** największe |C − dokładny| / Σ|a·b| to 0,8–2,6·10⁻⁷, przy granicy
+  N·ε = 3·10⁻⁵ dla N=256. MKL sumuje w innej kolejności niż my, ale mieści się w tej samej granicy
+  z ogromnym zapasem.
+- **Skalowanie MKL kończy się na 4 wątkach** (~310 GFLOP/s, 65% szczytu FMA przy 6 wątkach).
+  N=1024 to przy tej szybkości zadanie na 7 ms. Kandydaci: limit mocy (kod MKL jest gęsty od FMA,
+  jak `BM_PeakFma`) i narzut na wątek (pakowanie, synchronizacja). Bez liczników nie
+  rozstrzygniemy. **Pytanie otwarte.**
+- **`tiled_omp` na 1 wątku: 19,9 wobec 25,3 dla `tiled`** (−21%, w etapie 4 było −8 do −13%).
+  Różnica się utrzymuje. Najbardziej prawdopodobne wyjaśnienie to efekt z etapu 5 (dwie
+  skompilowane kopie tej samej pętli różnią się o kilka procent), ale nie jest potwierdzone.
+- **Fuzja w serii końcowej:** warstwa z fuzją 5–6% szybsza, ale przy CV 4–19%, a najszybsze
+  powtórzenie wersji bez fuzji (85,3 ms) jest szybsze od najszybszego z fuzją (87,8 ms). To szum.
+  Miarodajny pozostaje osobny pomiar z etapu 5 (15 powtórzeń, CV 2–3%): ±1%.
+- **Epilog w DRAM na 1 wątku: 2,05×** (w etapie 5: 2,66× przy CV 12%). Nadwyżka ponad 2×
+  z etapu 5 najpewniej była szumem; przy 6 wątkach 1,86×.
+- **PyTorch potwierdza tezę z etapu 5.** `F.linear` + ReLU wykonuje: `aten::linear` → `aten::t` →
+  `aten::addmm` (w nim `expand` + `copy_`: bias kopiowany do C, potem BLAS dodaje A·B) →
+  `aten::relu` (`clamp_min`), czyli osobny kernel. Koszt biasu i ReLU jest niewidoczny tak samo
+  jak u nas: 26,47 ms wobec 26,47 ms dla samego mnożenia (1 wątek).
+
+### Co dodaje BLAS (dlaczego MKL ma 89% szczytu, a my 28%)
+
+Wysokowydajne GEMM-y mają wspólną budowę (Goto i van de Geijn, *Anatomy of High-Performance
+Matrix Multiplication*, 2008; BLIS). Każdy element odpowiada na ograniczenie, które zmierzyliśmy:
+
+| technika | co robi | które nasze ograniczenie usuwa |
+|---|---|---|
+| **blokowanie rejestrowe** (mikrokernel) | blok C, np. 6×16 floatów = 12 rejestrów ymm, zostaje w rejestrach przez całą pętlę k. Krok: 2 odczyty wektorów B + 6 rozgłoszeń A na 12 FMA | u nas na każdą FMA przypadają 2 odczyty i 1 zapis (etap 2); tam 0,67 odczytu na FMA i żadnego zapisu |
+| 12 niezależnych akumulatorów | 2 jednostki FMA × 4 cykle opóźnienia ≥ 8 łańcuchów w locie | ten sam powód co 12 łańcuchów w `BM_PeakFma` (etap 5) |
+| **pakowanie** (packing) | panele A i B kopiowane do ciągłych, wyrównanych buforów w kolejności czytania przez mikrokernel | konflikty zbiorów cache przy kroku 4 KiB (wersja naiwna 5× wolniejsza dla N=1024 niż dla 1000), chybienia TLB |
+| **trzy poziomy blokowania** | pasek B w L1, blok A w L2, panel B w L3, rozmiary z parametrów cache | jeden rozmiar kafla T dla wszystkiego (etap 3) |
+| wątki na właściwej pętli | wątki dzielą spakowany panel B w L3 | – |
+
+Do tego prefetch, osobne kernele na brzegi i wybór kodu pod mikroarchitekturę (tu: AVX2).
+
+Liczbowo: nasza pętla wewnętrzna kosztuje ~1,1 cyklu na wektor 8 floatów (model z etapu 3),
+a szczyt to 0,5 cyklu na FMA (2 jednostki). Nawet bez narzutu pętli dawałoby to ~45% szczytu.
+Mikrokernel z blokowaniem rejestrowym jest ograniczony samymi FMA, stąd ~90%.
+
+### Analogia: Tenstorrent Tensix
+
+Rdzeń Tensix (według dokumentacji TT-Metalium) nie ma hierarchii cache. Ma lokalną pamięć SRAM
+(~1–1,5 MB na rdzeń, zależnie od generacji) i pięć małych rdzeni RISC-V: dwa przesyłają dane
+po sieci na chipie (NoC), trzy sterują potokiem unpack → math → pack. Do tego silnik macierzowy
+(FPU) działający na kafelkach 32×32 i silnik wektorowy (SFPU). Program to zwykle trzy kernele na
+rdzeń (reader, compute, writer) połączone buforami cyklicznymi w SRAM.
+
+| u nas (CPU) | Tensix |
+|---|---|
+| kafelkowanie pod cache: dobieramy T i *liczymy*, że dane zostaną w L2 | kafel 32×32 to jednostka sprzętu; reader *jawnie* kopiuje bloki do SRAM, ponowne użycie jest zaplanowane |
+| blokowanie rejestrowe w BLAS: blok C w rejestrach | silnik math akumuluje wynik w rejestrach Dst, unpacker podaje SrcA/SrcB |
+| OpenMP: jeden kafelek C na wątek, bez wspólnych zapisów | wyjście podzielone na siatkę rdzeni, bloki wejścia przesyłane (multicast) po NoC |
+| fuzja: bias + ReLU na kafelku, póki jest w cache | SFPU nakłada aktywację na kafel w Dst przed spakowaniem: fuzja to normalny przepływ danych |
+| roofline: punkt przegięcia ~14 FLOP/B, epilog bez fuzji kosztuje 0,3% | stosunek F/BW o rząd wielkości wyższy: ze wzoru 8·F/(K·BW) przejście przez DRAM kosztowałoby tyle co matmul, więc wyniki pośrednie zostają w SRAM |
+| konflikty zbiorów cache przy kroku 4 KiB, poza naszą kontrolą | brak cache, brak konfliktów; w zamian przesył danych trzeba napisać i nałożyć na obliczenia (podwójne buforowanie) |
+
+### Podsumowanie projektu
+
+| krok | N=1024, GFLOP/s | co dał | dlaczego |
+|---|---|---|---|
+| naiwna | 0,45 | – | kolumny B co 4 KiB: konflikty cache, łańcuch zależności |
+| i-k-j | 20,1 | 45× (8–13× dla innych N) | ciągły dostęp, wektoryzacja AVX2 + FMA |
+| kafelki | 25,3 | +26% | B z L3 rzadziej (n³/T); dalej 2 odczyty + 1 zapis na FMA |
+| OpenMP (6) | 96,4 | 3,8× | 6 rdzeni P; dalej HT i limit mocy |
+| fuzja | – | 0% (warstwa), 2× (sam epilog) | O(N²) przy O(N³); epilog jest ograniczony pamięcią |
+| MKL (1 / 6) | 81 / 307 | 3,2× od nas | blokowanie rejestrowe, pakowanie, 3 poziomy cache |
+
+### Pytania otwarte (z całego projektu)
+
+1. Niestabilność wariantów z pętlą długości 256 (etap 3): 22–36 GFLOP/s między sesjami.
+2. `tiled_omp` na 1 wątku wolniejszy od `tiled` o 8–21% (etapy 4 i 6); hipoteza z etapu 5:
+   kod pętli zewnętrznych.
+3. `static` vs `dynamic` na mnożeniu macierzy: w WSL nie do rozstrzygnięcia (bez przypinania
+   wątków); na czystych FMA różnica 1,6× (etap 5).
+4. Plateau MKL od 4 wątków.
+5. Wszystkie wymagają natywnego Linuksa: `perf` (liczniki), `OMP_PLACES`/`taskset`, RAPL (moc).
+
+### Możliwe rozszerzenia (tylko jeśli zdecydujesz)
+
+- Mikrokernel 6×16 z blokowaniem rejestrowym i pakowaniem: najbardziej pouczający krok w stronę
+  BLAS, z przewidywalnym celem (szczyt FMA).
+- Pomiary na natywnym Linuksie z przypinaniem wątków i licznikami sprzętowymi.
+- Fuzja w `torch.compile` (Inductor) i porównanie z naszą.

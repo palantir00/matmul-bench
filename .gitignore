@@ -3,6 +3,10 @@ build/
 build-*/
 out/
 
+# Working measurements from each stage (quoted in docs/NOTES.md, kept locally only).
+# The final series (scripts/run_final.sh) writes results/final_* and is committed.
+results/stage*.json
+
 # Python
 .venv/
 __pycache__/

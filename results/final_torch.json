@@ -1,0 +1,262 @@
+{
+  "context": {
+    "date": "2026-11-23T18:29:13+0100",
+    "torch": "2.15.0+cpu",
+    "python": "3.12.3",
+    "machine": "x86_64",
+    "cpu_capability": "AVX2",
+    "mkl": true,
+    "config": [
+      "- Intel(R) oneAPI Math Kernel Library Version 2024.2-Product Build 20240605 for Intel(R) 64 architecture applications",
+      "- Intel(R) MKL-DNN v3.13.3 (Git Hash b38f97eb6f2173513112f15a0481750b8a66e901)",
+      "- OpenMP 201511 (a.k.a. OpenMP 4.5)",
+      "- CPU capability usage: AVX2",
+      "USE_MKL=ON",
+      "USE_MKLDNN=ON",
+      "USE_OPENMP=ON"
+    ],
+    "linear_relu_aten_ops": [
+      "aten::linear",
+      "aten::t",
+      "aten::transpose",
+      "aten::as_strided",
+      "aten::addmm",
+      "aten::expand",
+      "aten::copy_",
+      "aten::resolve_conj",
+      "aten::relu",
+      "aten::clamp_min"
+    ],
+    "max_error_over_scale": {
+      "256": 2.583787459363909e-07,
+      "512": 1.0309936396609252e-07,
+      "1000": 8.037195572959586e-08,
+      "1024": 8.217877850965315e-08
+    },
+    "reps": 5,
+    "min_time_s": 0.5,
+    "seed": 42
+  },
+  "results": [
+    {
+      "op": "matmul",
+      "n": 256,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 324,
+      "median_s": 0.00040242932098767653,
+      "cv": 0.04179134756613789,
+      "gflops": 83.37968992330836
+    },
+    {
+      "op": "matmul",
+      "n": 256,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 1109,
+      "median_s": 0.0001544754165919785,
+      "cv": 0.306182971871341,
+      "gflops": 217.21535206231897
+    },
+    {
+      "op": "matmul",
+      "n": 512,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 36,
+      "median_s": 0.0032202372222450825,
+      "cv": 0.015212276607484483,
+      "gflops": 83.3589072710775
+    },
+    {
+      "op": "matmul",
+      "n": 512,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 117,
+      "median_s": 0.0009540923931639647,
+      "cv": 0.31319644593388624,
+      "gflops": 281.35163630202874
+    },
+    {
+      "op": "matmul",
+      "n": 1000,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 22,
+      "median_s": 0.02430682904543408,
+      "cv": 0.025374036703779686,
+      "gflops": 82.28140315059692
+    },
+    {
+      "op": "matmul",
+      "n": 1000,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 72,
+      "median_s": 0.006276378402794257,
+      "cv": 0.06515178000000374,
+      "gflops": 318.6551019788093
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 20,
+      "median_s": 0.026467925349970757,
+      "cv": 0.06227454435206012,
+      "gflops": 81.13532207776053
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 86,
+      "median_s": 0.007001846104664532,
+      "cv": 0.03044739532399185,
+      "gflops": 306.7024918713047
+    },
+    {
+      "op": "linear_relu",
+      "n": 256,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 1082,
+      "median_s": 0.0004277104454708488,
+      "cv": 0.042373367244469114,
+      "gflops": 78.45128019508925
+    },
+    {
+      "op": "linear_relu",
+      "n": 256,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 4779,
+      "median_s": 0.00014708931408227122,
+      "cv": 0.033473054982576675,
+      "gflops": 228.12283957780954
+    },
+    {
+      "op": "linear_relu",
+      "n": 512,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 132,
+      "median_s": 0.0033944540909115776,
+      "cv": 0.03019744750711172,
+      "gflops": 79.0805970004773
+    },
+    {
+      "op": "linear_relu",
+      "n": 512,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 414,
+      "median_s": 0.0008930207439615677,
+      "cv": 0.12608255577892027,
+      "gflops": 300.59263215900444
+    },
+    {
+      "op": "linear_relu",
+      "n": 1000,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 21,
+      "median_s": 0.024520247619009405,
+      "cv": 0.02890839980695194,
+      "gflops": 81.56524481626741
+    },
+    {
+      "op": "linear_relu",
+      "n": 1000,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 58,
+      "median_s": 0.006915174068941771,
+      "cv": 0.0808086098363845,
+      "gflops": 289.2190391826333
+    },
+    {
+      "op": "linear_relu",
+      "n": 1024,
+      "threads": 1,
+      "reps": 5,
+      "iterations": 20,
+      "median_s": 0.026466737299961095,
+      "cv": 0.05681136255441656,
+      "gflops": 81.13896411414325
+    },
+    {
+      "op": "linear_relu",
+      "n": 1024,
+      "threads": 6,
+      "reps": 5,
+      "iterations": 94,
+      "median_s": 0.006692407297877969,
+      "cv": 0.09893392665839361,
+      "gflops": 320.88358529537265
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 2,
+      "reps": 5,
+      "iterations": 40,
+      "median_s": 0.012768061450015012,
+      "cv": 0.005122303618405405,
+      "gflops": 168.19183212792848
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 4,
+      "reps": 5,
+      "iterations": 75,
+      "median_s": 0.006961779893317726,
+      "cv": 0.025248718700603506,
+      "gflops": 308.46761617115544
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 8,
+      "reps": 5,
+      "iterations": 56,
+      "median_s": 0.007165652803580867,
+      "cv": 0.1381035409270013,
+      "gflops": 299.69127822197095
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 10,
+      "reps": 5,
+      "iterations": 49,
+      "median_s": 0.006903525877551518,
+      "cv": 0.057478532216541624,
+      "gflops": 311.0705581597169
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 12,
+      "reps": 5,
+      "iterations": 51,
+      "median_s": 0.0069462875882320575,
+      "cv": 0.04283556850627187,
+      "gflops": 309.15559149006805
+    },
+    {
+      "op": "matmul",
+      "n": 1024,
+      "threads": 16,
+      "reps": 5,
+      "iterations": 58,
+      "median_s": 0.008833911706899707,
+      "cv": 0.48960387534977395,
+      "gflops": 243.0954393989146
+    }
+  ]
+}

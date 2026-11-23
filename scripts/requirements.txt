@@ -1,0 +1,5 @@
+# Python tools: PyTorch reference benchmark and plots. CPU-only PyTorch build:
+#   pip install -r scripts/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+numpy==2.5.5
+matplotlib==3.11.2

@@ -1,0 +1,8 @@
+clock before:
+run 0: clock ~2.56 GHz | imul 2.77 cycles (expect 3) | vaddss 1.80 | vfmadd231ss 3.77
+run 1: clock ~2.58 GHz | imul 3.03 cycles (expect 3) | vaddss 1.82 | vfmadd231ss 3.80
+run 2: clock ~2.79 GHz | imul 3.09 cycles (expect 3) | vaddss 1.98 | vfmadd231ss 4.22
+clock after:
+run 0: clock ~2.77 GHz | imul 2.95 cycles (expect 3) | vaddss 1.94 | vfmadd231ss 3.91
+run 1: clock ~2.88 GHz | imul 3.03 cycles (expect 3) | vaddss 2.00 | vfmadd231ss 4.06
+run 2: clock ~2.86 GHz | imul 2.98 cycles (expect 3) | vaddss 1.98 | vfmadd231ss 3.92
