@@ -1,5 +1,9 @@
 # matmul-bench
 
+**TL;DR:** my plain C++ and OpenMP kernels go from 2.6 to 92 GFLOP/s at N = 1000 (36×) on a
+laptop CPU; Intel MKL reaches 319 on the same 6 cores. The remaining ~3.4× comes from register
+blocking and packing, which the roofline and the measurements below explain.
+
 Step-by-step optimization of single-precision matrix multiplication (`C = A·B`, square,
 row-major float32) on a laptop CPU. Every step is **measured** (fixed seed, repetitions,
 median and coefficient of variation), **tested** against a reference within a rounding-error
@@ -37,7 +41,7 @@ Measured roofs on this machine: FMA peak **91 GFLOP/s on one core, 470 on six**;
 - **6 threads: 3.8× over the best single-threaded version.** Beyond 6 threads the OS puts the
   extra threads on hyperthreads (which share a core's load/store ports) and the power limit lowers
   the clock for everyone.
-- **MKL is 3.2× faster than our code with 1 thread and with 6.** The gap is the structure of the
+- **MKL is 3.2× faster than my code with 1 thread and with 6.** The gap is the structure of the
   kernel (register blocking, packing; see below), not more parallelism.
 - **Fusing bias + ReLU into the matmul gives no measurable speedup here.** The epilogue is 0.3%
   of the run time. Fusing the two elementwise passes with each other, on the other hand, halves
@@ -73,22 +77,15 @@ listed as an open question in the notes.
 | PyTorch / MKL (CV) | 81.1 (6%) | 168 (1%) | 308 (3%) | 307 (3%) | 300 (14%) | 311 (6%) | 309 (4%) | 243 (49%) |
 | FMA peak | 91.3 | | | 470 | | 576 | | 410 |
 
-- Each thread computes whole tiles of C, so there are no locks, no atomics and no shared writes,
-  and every element is summed in the same order: the result is identical bit for bit for any thread
-  count.
-- **2 threads give 2.0×.** After that the speedup flattens. Windows performance counters, read
-  during a diagnostic run (stage 4 notes), showed that 6 threads land one per P-core at ~3.1 GHz, threads 7–16 go mostly to hyperthread siblings, and the clock
-  drops to ~2.0 GHz at 16 threads (power limit). Even the pure-FMA benchmark is slower at 16
-  threads than at 10.
-- MKL stops scaling at 4 threads (~310 GFLOP/s, 65% of the 6-thread FMA peak). N = 1024 is a
-  7 ms problem at that speed; the power budget and per-thread overheads are likely causes, but
-  this was not diagnosed (no hardware counters under WSL2).
-- With a fixed amount of work per thread, the FMA benchmark reached only 299 GFLOP/s on 6 threads
-  instead of ~490: the slowest core (an E-core or a hyperthread sibling) sets the pace. Dynamic
-  scheduling fixes that.
-- The OpenMP version on one thread is slower than the serial tiled kernel (19.9 vs 25.3) despite an
-  identical inner loop. A measurement in stage 5 showed that two compiled copies of the same loop
-  can differ by 3–8%, which is the likely cause; not confirmed.
+- Each thread computes whole tiles of C: no locks, no atomics, no shared writes, and every
+  element is summed in the same order, so the result is identical bit for bit for any thread count.
+- **2 threads give 2.0×, then the curve flattens.** In a diagnostic run with Windows performance
+  counters (stage 4 notes), 6 threads landed one per P-core at ~3.1 GHz, threads 7–16 went mostly
+  to hyperthread siblings, and the clock fell to ~2.0 GHz at 16 threads (power limit). Work has to
+  be shared dynamically: with a fixed share per thread, the slowest core sets the pace, and the
+  FMA benchmark fell from ~470–490 to 299 GFLOP/s on 6 threads.
+- **MKL stops scaling at 4 threads** (~310 GFLOP/s, 65% of the 6-thread FMA peak). The cause was
+  not diagnosed (see Limitations).
 
 ### Fusion: when it pays off
 
@@ -99,7 +96,7 @@ applies bias and ReLU to each C tile right after its last k block, while it is s
 |---|---|---|---|---|
 | relu(A·B + bias), N=1024, final run | 1 | 93.0 ms (CV 9%) | 88.1 ms (CV 4%) | 1.06, within noise |
 | | 6 | 17.9 ms (CV 17%) | 17.0 ms (CV 19%) | 1.05, within noise |
-| same, dedicated run with 15 repetitions | 1 | 88.1 ms (CV 3%) | 88.9 ms (CV 3%) | 0.99 |
+| same, dedicated run with 15 repetitions (stage 5 notes) | 1 | 88.1 ms (CV 3%) | 88.9 ms (CV 3%) | 0.99 |
 | | 6 | 17.8 ms (CV 5%) | 18.4 ms (CV 17%) | 0.97 |
 | bias + ReLU alone, 4096² floats in DRAM | 1 | 17.0 ms | 8.3 ms | **2.05** |
 | | 6 | 7.8 ms | 4.2 ms | **1.86** |
@@ -129,32 +126,32 @@ measured on this machine. The ridge point is at 470 / 33 ≈ 14 FLOP/B.
   fused). They cannot compute faster, only move fewer bytes. Fusion moves the point to the right
   and doubles the attainable rate, and the measurement follows the roof.
 - **Matrix multiplication is far to the right of the ridge point** (AI ≈ N/6 ≈ 170 FLOP/B when
-  every matrix crosses DRAM once), so bandwidth limits neither implementation. Ours stays at 20%
+  every matrix crosses DRAM once), so bandwidth limits neither implementation. My kernel stays at 20%
   of the compute roof (28% on one core) because of its instruction mix, and MKL reaches 65% (89% on
   one core). The roofline shows that the gap is inside the core, not in memory.
 
 ## What BLAS does that this code does not
 
-MKL reaches 81 GFLOP/s on one core (89% of the measured FMA peak), where our best
+MKL reaches 81 GFLOP/s on one core (89% of the measured FMA peak), where my best
 single-threaded kernel reaches 25. High-performance GEMMs share a structure (Goto & van de Geijn,
 *Anatomy of High-Performance Matrix Multiplication*, 2008; the BLIS framework), and each part
 targets a limit that showed up in the measurements above:
 
 1. **Register blocking (micro-kernel).** A small block of C, for example 6×16 floats in 12 AVX2
    registers, stays in registers for the whole k loop. Each step loads 2 vectors of B and
-   broadcasts 6 elements of A for 12 FMAs, which is 0.67 loads per FMA and no stores. Our inner loop
+   broadcasts 6 elements of A for 12 FMAs, which is 0.67 loads per FMA and no stores. My inner loop
    needs 2 loads and 1 store per FMA. The 12 independent accumulators also hide the 4-cycle FMA
    latency on two FMA units, the same reason the peak benchmark uses 12 chains.
 2. **Packing.** Panels of A and B are copied into contiguous, aligned buffers in exactly the order
    the micro-kernel reads them. This gives unit stride and no TLB misses, and it removes the cache-set
-   conflicts that make our naive kernel 5× slower at N = 1024 than at N = 1000.
+   conflicts that make my naive kernel 5× slower at N = 1024 than at N = 1000.
 3. **Cache blocking on three levels.** A sliver of B stays in L1, a block of A in L2 and a panel
    of B in L3, with sizes derived from the cache parameters instead of one tile size for all.
 4. **Parallelism on the right loop.** Threads share a packed panel of B in L3. On top of that come
    prefetching, edge-case kernels and dispatch per microarchitecture (MKL selects its AVX2 path on
    this CPU).
 
-On accuracy, MKL's results stay within the same error bound as ours. The largest
+On accuracy, MKL's results stay within the same error bound as mine. The largest
 `|C − exact| / Σ|a·b|` is 0.8–2.6·10⁻⁷, against a bound of N·ε = 3·10⁻⁵ at N = 256.
 
 ## The same ideas on a spatial accelerator (Tenstorrent Tensix)
@@ -180,6 +177,21 @@ Sources: TT-Metalium documentation,
 [tiles](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html),
 [single-core matmul example](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/examples/matmul_single_core.html),
 [Metalium guide](https://github.com/tenstorrent/tt-metal/blob/main/METALIUM_GUIDE.md).
+
+## Limitations and next steps
+
+- **Open questions** (details in the notes):
+  - MKL stops scaling at 4 threads.
+  - The OpenMP kernel on one thread is 8–21% slower than the serial one, with an identical inner
+    loop. Stage 5 showed that two compiled copies of the same loop can differ by 3–8%, which makes
+    code layout the main suspect.
+  - Variants with a 256-float inner loop varied by up to 1.5× between sessions.
+- **What these need:** hardware counters and thread pinning, which WSL2 does not provide. The
+  next measurement belongs on native Linux, with `perf`, `OMP_PLACES` and RAPL power readings.
+- **Next optimization:** a 6×16 register-blocked AVX2 micro-kernel with packing. This step should
+  close most of the gap to MKL, with the measured FMA peak as the target.
+- **Scope:** square float32 matrices up to N = 1024 on one machine; no non-square shapes and no
+  bf16/int8.
 
 ## Methodology
 

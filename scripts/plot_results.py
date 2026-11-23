@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator  # noqa: E402
 
 # Light-mode chart palette: surface, inks, hairlines, and categorical slots in fixed order
-# (slot 1 = our code / 1 thread, slot 2 = PyTorch / 6 threads, ...).
+# (slot 1 = my code / 1 thread, slot 2 = PyTorch / 6 threads, ...).
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
 INK2 = "#52514e"
@@ -139,7 +139,7 @@ def chart_versions(cpp, torch, path, n=1024):
                 markeredgecolor=SURFACE, markeredgewidth=2, zorder=3)
         ax.text(g * 1.18, y, f"{fmt(g)}", va="center", fontsize=9, color=INK2)
     ax.set_yticks(ys, [r[0] for r in rows])
-    ax.axhline(1.5, color=AXIS, linewidth=0.8)  # our versions above, the BLAS reference below
+    ax.axhline(1.5, color=AXIS, linewidth=0.8)  # my versions above, the BLAS reference below
     for value, label in [(cpp.gflops(peak(1)), "FMA peak, 1 core"), (cpp.gflops(peak(6)), "FMA peak, 6 cores")]:
         ax.axvline(value, color=INK2, linewidth=1.0)
         ax.text(value, len(rows) - 0.45, f"{label}\n{value:.0f}", ha="center", va="bottom",
@@ -163,7 +163,7 @@ def chart_versions(cpp, torch, path, n=1024):
 
 def chart_threads(cpp, torch, path, n=1024):
     fig, ax = plt.subplots(figsize=(8, 4.4))
-    ours = [cpp.gflops(omp(n, p)) for p in THREADS]
+    mine = [cpp.gflops(omp(n, p)) for p in THREADS]
     mkl = [torch[("matmul", n, p)]["gflops"] for p in THREADS]
     peak_threads = [1, 6, 10, 16]
     peaks = [cpp.gflops(peak(p)) for p in peak_threads]
@@ -172,7 +172,7 @@ def chart_threads(cpp, torch, path, n=1024):
     ax.plot(peak_threads, peaks, "o", color=SLOTS[2], label="FMA peak (measured)", markersize=8,
             markeredgecolor=SURFACE, markeredgewidth=2)
     ax.text(16.3, peaks[-1], f"FMA peak\n{fmt(peaks[-1])}", va="center", fontsize=8, color=INK2)
-    for label, ys, color in [("PyTorch (MKL)", mkl, SLOTS[1]), ("tiled + OpenMP (ours)", ours, SLOTS[0])]:
+    for label, ys, color in [("PyTorch (MKL)", mkl, SLOTS[1]), ("tiled + OpenMP (my code)", mine, SLOTS[0])]:
         ax.plot(THREADS, ys, "-o", color=color, label=label, markeredgecolor=SURFACE, markeredgewidth=2)
         ax.text(16.3, ys[-1], f"{label}\n{fmt(ys[-1])}", va="center", fontsize=8, color=INK2)
     for x, text in [(6, "6 P-cores"), (10, "+ 4 E-cores")]:
@@ -233,7 +233,7 @@ def chart_roofline(cpp, torch, path, n=1024):
     points = [  # (label, AI, GFLOP/s, slot, label offset factors)
         ("bias + ReLU, 2 passes", 2 / 16, cpp.gflops(epilogue(4096, 6, 2)), 0, (1.15, 0.8)),
         ("bias + ReLU, fused", 2 / 8, cpp.gflops(epilogue(4096, 6, 1)), 0, (1.15, 0.9)),
-        ("matmul, ours", n / 6, cpp.gflops(omp(n, 6)), 0, (1.15, 0.85)),
+        ("matmul, my code", n / 6, cpp.gflops(omp(n, 6)), 0, (1.15, 0.85)),
         ("matmul, PyTorch (MKL)", n / 6, torch[("matmul", n, 6)]["gflops"], 1, (1.15, 0.95)),
     ]
     for label, ai, g, slot, (dx, dy) in points:
@@ -249,7 +249,7 @@ def chart_roofline(cpp, torch, path, n=1024):
     ax.yaxis.set_major_formatter(fmt_axis)
     ax.set_xlabel("arithmetic intensity (FLOP per byte of DRAM traffic, log)")
     ax.set_ylabel("GFLOP/s (log)")
-    ax.plot([], [], "o", color=SLOTS[0], label="our kernels")
+    ax.plot([], [], "o", color=SLOTS[0], label="my kernels")
     ax.plot([], [], "o", color=SLOTS[1], label="PyTorch (MKL)")
     ax.legend(loc="upper left", fontsize=9)
     title(ax, "Roofline, 6 threads (measured roofs)",
